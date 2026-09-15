@@ -1,0 +1,6 @@
+{
+  "name": "YABBAI",
+  "description": "Evidence-first crypto revenue & yield operating system with 20-agent fleet, zero-capital discovery, opportunity ranker, and on-chain verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -12,6 +12,28 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+      // Shim to prevent multi-wallet extension collision ("Cannot redefine property: ethereum")
+      (function() {
+        try {
+          let _eth = window.ethereum;
+          Object.defineProperty(window, 'ethereum', {
+            get() { return _eth; },
+            set(v) { _eth = v; },
+            configurable: true,
+            enumerable: true
+          });
+        } catch (e) {
+          // Property already locked or non-configurable
+        }
+        window.addEventListener('error', function(event) {
+          if (event && event.message && event.message.includes('Cannot redefine property: ethereum')) {
+            event.stopImmediatePropagation();
+            event.preventDefault();
+          }
+        });
+      })();
+    </script>
   </head>
   <body class="bg-slate-950 text-slate-100 antialiased selection:bg-emerald-500/20 selection:text-emerald-300 font-sans">
     <div id="root"></div>

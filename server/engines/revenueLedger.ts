@@ -35,74 +35,51 @@ export class RevenueLedger {
   private processedWebhookIds: Set<string> = new Set();
 
   private capitalBuckets: CapitalBuckets = {
-    treasuryReserveUsd: 124.50,
-    operatingBudgetUsd: 118.20,
-    growthReinvestmentUsd: 142.80,
-    strategyCapitalUsd: 215.00,
-    networkAndGasFeesUsd: 32.50,
-    userCustomerFundsUsd: 35.00,
-    totalVerifiedCapitalUsd: 668.00
+    treasuryReserveUsd: 0.00,
+    operatingBudgetUsd: 0.00,
+    growthReinvestmentUsd: 0.00,
+    strategyCapitalUsd: 0.00,
+    networkAndGasFeesUsd: 0.00,
+    userCustomerFundsUsd: 0.00,
+    totalVerifiedCapitalUsd: 0.00
   };
 
   constructor() {
-    this.seedVerifiedHistoricalRecords();
+    // Zero-Capital Clean Start: No fake seeded balances or mock historical records
   }
 
-  private seedVerifiedHistoricalRecords() {
-    const historical: RevenueLedgerEntry[] = [
-      {
-        id: 'rev-01',
-        allocationId: 'alloc-seed-01',
-        timestamp: Date.now() - 86400000 * 2,
-        source: 'ON_CHAIN_TX',
-        authoritativeEvidence: {
-          transactionSignature: '4Z3dK9tGv1xS7qW2aE5rF8hJ0kL2mN4pQ6rT8vW0xY2aC4eG6iK8mO0qS2uU4wX',
-          recipientAddress: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU',
-          senderAddress: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',
-          assetMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-          amount: '85000000', // 85 USDC
-          amountUsd: 85.00,
-          network: 'solana-mainnet',
-          slotConfirmed: 289120400,
-          verifiedAt: Date.now() - 86400000 * 2 + 1500
-        },
-        state: 'VERIFIED',
-        pnlCategory: 'REVENUE',
-        allocatedCapitalUsd: 0,
-        realizedPnlUsd: 85.00,
-        verificationEvidenceUrl: 'https://solscan.io/account/7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU'
-      },
-      {
-        id: 'rev-02',
-        allocationId: 'alloc-seed-02',
-        timestamp: Date.now() - 86400000,
-        source: 'WEBHOOK_BILLING',
-        authoritativeEvidence: {
-          webhookEventId: 'evt_stripe_sec_rep_381920',
-          recipientAddress: 'billing_yabbai_main',
-          senderAddress: 'cus_solana_foundation_912',
-          assetMint: 'USD',
-          amount: '15000', // $150.00 in cents
-          amountUsd: 150.00,
-          network: 'fiat-clearing',
-          verifiedAt: Date.now() - 86400000 + 400
-        },
-        state: 'VERIFIED',
-        pnlCategory: 'SERVICE_FEE',
-        allocatedCapitalUsd: 0,
-        realizedPnlUsd: 150.00
-      }
-    ];
+  public resetAll() {
+    this.entries.clear();
+    this.allocationHistory.clear();
+    this.withdrawals.clear();
+    this.processedSignatures.clear();
+    this.processedWebhookIds.clear();
+    this.capitalBuckets = {
+      treasuryReserveUsd: 0.00,
+      operatingBudgetUsd: 0.00,
+      growthReinvestmentUsd: 0.00,
+      strategyCapitalUsd: 0.00,
+      networkAndGasFeesUsd: 0.00,
+      userCustomerFundsUsd: 0.00,
+      totalVerifiedCapitalUsd: 0.00
+    };
+  }
 
-    for (const h of historical) {
-      this.entries.set(h.id, h);
-      if (h.authoritativeEvidence.transactionSignature) {
-        this.processedSignatures.add(h.authoritativeEvidence.transactionSignature);
-      }
-      if (h.authoritativeEvidence.webhookEventId) {
-        this.processedWebhookIds.add(h.authoritativeEvidence.webhookEventId);
-      }
-    }
+  public syncWithOnChainBalance(realBalanceSol: number, solPriceUsd: number) {
+    const onChainUsd = Math.round(realBalanceSol * solPriceUsd * 100) / 100;
+    this.capitalBuckets.treasuryReserveUsd = onChainUsd;
+    this.recalculateTotalCapital();
+  }
+
+  private recalculateTotalCapital() {
+    this.capitalBuckets.totalVerifiedCapitalUsd = Math.round(
+      (this.capitalBuckets.treasuryReserveUsd +
+       this.capitalBuckets.operatingBudgetUsd +
+       this.capitalBuckets.growthReinvestmentUsd +
+       this.capitalBuckets.strategyCapitalUsd +
+       this.capitalBuckets.networkAndGasFeesUsd +
+       this.capitalBuckets.userCustomerFundsUsd) * 100
+    ) / 100;
   }
 
   public getCapitalBuckets(): CapitalBuckets {
@@ -283,18 +260,21 @@ export class RevenueLedger {
     solPriceUsd?: number;
     sourceBucket?: keyof CapitalBuckets;
     userSignature?: string;
+    onChainAvailableUsd?: number;
     note?: string;
   }): TreasuryWithdrawalRecord {
     const bucketKey: keyof CapitalBuckets = params.sourceBucket || 'treasuryReserveUsd';
     const currentAvailable = this.capitalBuckets[bucketKey] || 0;
+    const onChainAvail = params.onChainAvailableUsd || 0;
+    const effectiveAvailable = Math.max(currentAvailable, onChainAvail);
 
     if (params.amountUsd <= 0) {
       throw new Error('Withdrawal amount must be greater than 0 USD');
     }
 
-    if (params.amountUsd > currentAvailable) {
+    if (params.amountUsd > effectiveAvailable) {
       throw new Error(
-        `Insufficient funds in ${bucketKey}. Requested $${params.amountUsd.toFixed(2)} USD, available: $${currentAvailable.toFixed(2)} USD`
+        `Insufficient funds. Requested $${params.amountUsd.toFixed(2)} USD, but available in ${bucketKey} is $${currentAvailable.toFixed(2)} USD (On-chain Vault: $${onChainAvail.toFixed(2)} USD)`
       );
     }
 
@@ -311,8 +291,8 @@ export class RevenueLedger {
       : Math.round(params.amountUsd * 100) / 100;
 
     // Deduct from bucket and total verified capital
-    this.capitalBuckets[bucketKey] = Math.round((currentAvailable - params.amountUsd) * 100) / 100;
-    this.capitalBuckets.totalVerifiedCapitalUsd = Math.round((this.capitalBuckets.totalVerifiedCapitalUsd - params.amountUsd) * 100) / 100;
+    this.capitalBuckets[bucketKey] = Math.max(0, Math.round((currentAvailable - params.amountUsd) * 100) / 100);
+    this.recalculateTotalCapital();
 
     // Determine if this is a broadcasted on-chain transaction or an internal ledger allocation
     const isBroadcastedOnChain = Boolean(params.userSignature && params.userSignature.length >= 64 && !params.userSignature.startsWith('internal-'));

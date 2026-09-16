@@ -10,7 +10,8 @@ import {
   PiggyBank,
   Zap,
   Layers,
-  Fuel
+  Fuel,
+  RotateCcw
 } from 'lucide-react';
 import { CapitalBuckets, CurrentPredicament, ExecutionTier } from '../types/yabbai';
 
@@ -33,6 +34,7 @@ interface CapitalOverviewProps {
   realizedRevenueTotal: number;
   onOpenVerifyModal: () => void;
   onOpenWithdrawModal?: () => void;
+  onResetCleanStart?: () => void;
 }
 
 export const CapitalOverview: React.FC<CapitalOverviewProps> = ({
@@ -41,6 +43,7 @@ export const CapitalOverview: React.FC<CapitalOverviewProps> = ({
   realizedRevenueTotal,
   onOpenVerifyModal,
   onOpenWithdrawModal,
+  onResetCleanStart,
 }) => {
   const currentTierIndex = TIERS.findIndex(t => t.tier === predicament?.currentTier);
 
@@ -157,9 +160,22 @@ export const CapitalOverview: React.FC<CapitalOverviewProps> = ({
               Autonomous Capital Loop (Evidence-Verified Reinvestment)
             </h3>
           </div>
-          <span className="text-[11px] font-mono text-slate-400">
-            Total Capital: <strong className="text-white">${(buckets?.totalVerifiedCapitalUsd || 0).toFixed(2)}</strong>
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] font-mono text-slate-400">
+              Total Capital: <strong className="text-white">${(buckets?.totalVerifiedCapitalUsd || 0).toFixed(2)}</strong>
+            </span>
+            {onResetCleanStart && (
+              <button
+                type="button"
+                onClick={onResetCleanStart}
+                className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 transition cursor-pointer"
+                title="Purge all simulated balances and sync exclusively with real on-chain treasury funds"
+              >
+                <RotateCcw className="w-2.5 h-2.5" />
+                <span>Reset to Real Balance</span>
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Proportional Split Bar */}

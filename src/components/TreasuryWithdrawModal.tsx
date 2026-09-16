@@ -86,6 +86,8 @@ export const TreasuryWithdrawModal: React.FC<TreasuryWithdrawModalProps> = ({
   const [isLoadingBalance, setIsLoadingBalance] = useState<boolean>(false);
   const [signerInfo, setSignerInfo] = useState<TreasurySignerInfo | null>(null);
   const [copiedSigner, setCopiedSigner] = useState(false);
+  const [isRequestingAirdrop, setIsRequestingAirdrop] = useState(false);
+  const [airdropSuccessMsg, setAirdropSuccessMsg] = useState<string | null>(null);
 
   // Sync recipient address if connected wallet changes
   useEffect(() => {
@@ -114,6 +116,34 @@ export const TreasuryWithdrawModal: React.FC<TreasuryWithdrawModalProps> = ({
       }
     } catch {
       // ignore
+    }
+  };
+
+  const handleRequestDevnetAirdrop = async (targetAddr?: string) => {
+    setIsRequestingAirdrop(true);
+    setError(null);
+    setAirdropSuccessMsg(null);
+    try {
+      const res = await fetch('/api/solana/airdrop-devnet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          address: targetAddr || signerInfo?.publicKey,
+          amountSol: 0.5
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to request Devnet SOL airdrop');
+      }
+      setAirdropSuccessMsg(`Airdropped 0.5 SOL! On-chain balance: ${data.newBalanceSol} SOL`);
+      fetchSignerInfo();
+      if (recipientAddress) fetchWalletBalance(recipientAddress);
+      if (onWithdrawSuccess) onWithdrawSuccess();
+    } catch (err: any) {
+      setError(err.message || 'Devnet airdrop request failed');
+    } finally {
+      setIsRequestingAirdrop(false);
     }
   };
 
@@ -296,7 +326,7 @@ export const TreasuryWithdrawModal: React.FC<TreasuryWithdrawModalProps> = ({
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Failed to process treasury withdrawal');
+        throw new Error(data.message || data.error || 'Failed to process treasury withdrawal');
       }
 
       setSuccessRecord(data.withdrawal);
@@ -528,16 +558,38 @@ export const TreasuryWithdrawModal: React.FC<TreasuryWithdrawModalProps> = ({
 
                 <div className="flex items-center justify-between text-[11px] text-slate-300 pt-0.5">
                   <span>Signer On-Chain Balance:</span>
-                  <span className="font-bold text-white">
-                    {signerInfo ? `${signerInfo.balanceSol.toFixed(4)} SOL ($${signerInfo.balanceUsd.toFixed(2)})` : '...'}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-white">
+                      {signerInfo ? `${signerInfo.balanceSol.toFixed(4)} SOL ($${signerInfo.balanceUsd.toFixed(2)})` : '...'}
+                    </span>
+                    {cluster === 'devnet' && (
+                      <button
+                        type="button"
+                        onClick={() => handleRequestDevnetAirdrop()}
+                        disabled={isRequestingAirdrop}
+                        className="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold transition cursor-pointer"
+                      >
+                        {isRequestingAirdrop ? 'Airdropping...' : '+ Airdrop 0.5 SOL'}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
-                {!signerInfo?.isGasFunded && (
-                  <p className="text-purple-200/80 text-[10px] leading-relaxed pt-0.5 border-t border-slate-800/80">
-                    💡 <strong>Live SOL Broadcasts:</strong> To execute on-chain transfers directly from the server to your Phantom wallet, send ~0.02 SOL to the Server AA Signer address above. Until funded, withdrawals are settled in the verifiable strategy ledger.
-                  </p>
+                {airdropSuccessMsg && (
+                  <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[10px] flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>{airdropSuccessMsg}</span>
+                  </div>
                 )}
+
+                <div className="text-slate-400 text-[10px] leading-relaxed pt-1 border-t border-slate-800/80 space-y-1">
+                  <p className="text-purple-300/90 font-medium">
+                    🔐 <strong>Private Key Security:</strong> You do <em>not</em> need to share your private key. YABBAI uses its own server-side AA Treasury Keypair to sign transactions and transfer real SOL directly to your destination Phantom wallet.
+                  </p>
+                  <p className="text-slate-400">
+                    To execute live transfers, the Treasury Signer address above needs SOL. On Devnet, click &quot;+ Airdrop 0.5 SOL&quot;. On Mainnet, send SOL to the Signer address above.
+                  </p>
+                </div>
               </div>
 
               {/* Error Notice */}

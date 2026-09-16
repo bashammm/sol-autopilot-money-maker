@@ -46,6 +46,10 @@ import { TestSuiteModal } from './components/TestSuiteModal';
 import { AuditTrailModal } from './components/AuditTrailModal';
 import { NewRevenueModal } from './components/NewRevenueModal';
 import { TreasuryWithdrawModal } from './components/TreasuryWithdrawModal';
+import { CustomerStoreModal } from './components/CustomerStoreModal';
+import { TreasuryReconciliationModal } from './components/TreasuryReconciliationModal';
+import { ExecutionPipelineBanner } from './components/ExecutionPipelineBanner';
+import { MarketPriceInfo, TreasurySignerStatus } from './types/yabbai';
 
 type NavTab = 
   | 'overview' 
@@ -82,6 +86,13 @@ export function App() {
   const [showAuditModal, setShowAuditModal] = useState(false);
   const [showRevenueModal, setShowRevenueModal] = useState(false);
   const [showWithdrawModal, setShowWithdrawModal] = useState(false);
+  const [showStoreModal, setShowStoreModal] = useState(false);
+  const [showReconciliationModal, setShowReconciliationModal] = useState(false);
+
+  // Solana & Price State
+  const [solPrice, setSolPrice] = useState<MarketPriceInfo | undefined>();
+  const [solCluster, setSolCluster] = useState<'mainnet-beta' | 'devnet'>('mainnet-beta');
+  const [treasurySigner, setTreasurySigner] = useState<TreasurySignerStatus | undefined>();
 
   // Phantom Wallet Connection
   const [connectedPhantomAddress, setConnectedPhantomAddress] = useState<string>('');
@@ -161,6 +172,9 @@ export function App() {
       if (statusRes.capitalBuckets) setCapitalBuckets(statusRes.capitalBuckets);
       if (statusRes.autopilot) setAutopilotStatus(statusRes.autopilot);
       if (statusRes.profitSweep) setProfitSweepStatus(statusRes.profitSweep);
+      if (statusRes.solPrice) setSolPrice(statusRes.solPrice);
+      if (statusRes.cluster) setSolCluster(statusRes.cluster);
+      if (statusRes.treasurySigner) setTreasurySigner(statusRes.treasurySigner);
       if (statusRes.activeProvider) {
         setActiveProviderName(statusRes.activeProvider.name);
       } else if (statusRes.activeRpcProvider) {
@@ -198,6 +212,20 @@ export function App() {
     return () => clearInterval(timer);
   }, [fetchAllData]);
 
+  const handleResetCleanStart = async () => {
+    try {
+      const res = await fetch('/api/system/reset-clean-start', { method: 'POST' });
+      if (res.ok) {
+        await fetchAllData();
+      } else {
+        const data = await res.json();
+        setErrorNotice(`Reset failed: ${data.error || 'Server error'}`);
+      }
+    } catch (err: any) {
+      setErrorNotice(`Reset failed: ${err.message}`);
+    }
+  };
+
   // Actions
   const handleEmergencyStopToggle = async () => {
     const isCurrentlyStopped = securityState?.emergencyStopEngaged || false;
@@ -214,7 +242,7 @@ export function App() {
       });
       await fetchAllData();
     } catch (err: any) {
-      alert(`Emergency stop failed: ${err.message}`);
+      setErrorNotice(`Emergency stop failed: ${err.message}`);
     }
   };
 
@@ -406,10 +434,14 @@ export function App() {
         predicament={predicament}
         securityState={securityState}
         activeProviderName={activeProviderName}
+        solPrice={solPrice}
+        solCluster={solCluster}
         isEmergencyStopped={securityState?.emergencyStopEngaged || false}
         onEmergencyStopToggle={handleEmergencyStopToggle}
         onOpenTestModal={() => setShowTestModal(true)}
         onOpenAuditModal={() => setShowAuditModal(true)}
+        onOpenStore={() => setShowStoreModal(true)}
+        onOpenReconciliation={() => setShowReconciliationModal(true)}
         onRefreshData={fetchAllData}
         isRefreshing={isRefreshing}
         connectedPhantomAddress={connectedPhantomAddress}
@@ -427,6 +459,14 @@ export function App() {
             <span>{errorNotice}</span>
           </div>
         )}
+
+        {/* Canonical Crypto Execution & Settlement Architecture Banner */}
+        <ExecutionPipelineBanner
+          onOpenStore={() => setShowStoreModal(true)}
+          onOpenReconciliation={() => setShowReconciliationModal(true)}
+          cluster={solCluster}
+          treasurySignerAddress={treasurySigner?.address}
+        />
 
         {/* Autonomous Autopilot Execution & Revenue Harvesting Hub */}
         <AutopilotControlBanner
@@ -450,6 +490,7 @@ export function App() {
           realizedRevenueTotal={realizedRevenueTotal}
           onOpenVerifyModal={() => setShowRevenueModal(true)}
           onOpenWithdrawModal={() => setShowWithdrawModal(true)}
+          onResetCleanStart={handleResetCleanStart}
         />
 
         {/* Navigation Tabs */}
@@ -575,7 +616,7 @@ export function App() {
               onClick={() => setShowTestModal(true)}
               className="text-slate-400 hover:text-white underline cursor-pointer"
             >
-              Verify 16 Invariants
+              Verify 22 Invariants
             </button>
           </div>
         </div>
@@ -610,6 +651,23 @@ export function App() {
         connectedPhantomAddress={connectedPhantomAddress}
         onConnectPhantom={handleConnectPhantom}
         onWithdrawSuccess={fetchAllData}
+      />
+
+      {/* Real Customer Storefront & Inbound Revenue Settlement Modal */}
+      <CustomerStoreModal
+        isOpen={showStoreModal}
+        onClose={() => setShowStoreModal(false)}
+        solPriceUsd={solPrice?.solPriceUsd || 150}
+        cluster={solCluster}
+        connectedWallet={connectedPhantomAddress}
+        onPaymentVerified={fetchAllData}
+      />
+
+      {/* Continuous Treasury Cryptographic Reconciliation Modal */}
+      <TreasuryReconciliationModal
+        isOpen={showReconciliationModal}
+        onClose={() => setShowReconciliationModal(false)}
+        solPriceUsd={solPrice?.solPriceUsd || 150}
       />
 
     </div>

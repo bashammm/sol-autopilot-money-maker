@@ -28,6 +28,11 @@ import { EarningTaskQueue } from '../server/engines/taskQueue';
 import { SecurityGuard } from '../server/security/guard';
 import { SolanaProviderManager } from '../server/solana/provider';
 import { TransactionStateMachine } from '../server/solana/txStateMachine';
+import { CentralizedTreasuryManager } from '../server/solana/treasuryConfig';
+import { CryptoExecutionEngine } from '../server/solana/cryptoExecutionEngine';
+import { InboundPaymentEngine } from '../server/engines/paymentEngine';
+import { TreasuryReconciliationService } from '../server/engines/treasuryReconciliation';
+import { marketPriceService } from '../server/solana/priceService';
 
 export interface TestResult {
   name: string;
@@ -394,6 +399,141 @@ export async function runAllVerificationTests(): Promise<{
     // Complete task
     const completed = queue.completeTask(leased.id);
     if (completed.status !== 'COMPLETED') throw new Error('Failed to complete task');
+  });
+
+  // 17. Centralized Treasury Configuration & Daily/Weekly Limits
+  await runTest('17. Treasury Config & Spending Limits: Enforce per-tx, daily, and weekly limits', () => {
+    const tm = new CentralizedTreasuryManager();
+    const config = tm.getConfig();
+    if (!config.address) throw new Error('Treasury address must not be empty');
+
+    // Check limits
+    const allowedSmall = tm.verifySpendingPolicy(50.0);
+    if (!allowedSmall.allowed) throw new Error('Legitimate spend under limit was blocked');
+
+    const blockedPerTx = tm.verifySpendingPolicy(150.0); // Default per-tx is $100
+    if (blockedPerTx.allowed) throw new Error('Spend exceeding per-transaction limit was not blocked');
+
+    // Blocklist check
+    const blockedDest = tm.verifyDestinationPolicy('SCAM111111111111111111111111111111111111111');
+    if (blockedDest.allowed) throw new Error('Destination in blocklist was not rejected');
+  });
+
+  // 18. Canonical Crypto Execution: Preparation & Pre-flight Policy
+  await runTest('18. Canonical Execution Engine: Prepare intent, pre-flight checks & serialize transaction', async () => {
+    const pm = new SolanaProviderManager();
+    const tm = new CentralizedTreasuryManager();
+    const sec = new SecurityGuard();
+    const ledger = new RevenueLedger();
+    const execEngine = new CryptoExecutionEngine(pm, tm, sec, ledger, marketPriceService);
+
+    const prep = await execEngine.prepareTransactionIntent({
+      type: 'OUTBOUND_TRANSFER',
+      destination: tm.getTreasuryAddress(),
+      asset: 'SOL',
+      amount: 0.001,
+      purpose: 'Verification test transfer'
+    });
+
+    if (!prep.intent) throw new Error('Failed to create transaction intent');
+    if (!prep.preview) throw new Error('Failed to generate preview payload');
+    if (prep.preview.asset !== 'SOL') throw new Error('Preview asset mismatch');
+  });
+
+  // 19. Emergency Stop Enforces Freeze on Crypto Execution
+  await runTest('19. Emergency Stop Enforcement: Circuit breaker blocks transaction preparation', async () => {
+    const pm = new SolanaProviderManager();
+    const tm = new CentralizedTreasuryManager();
+    const sec = new SecurityGuard();
+    const ledger = new RevenueLedger();
+    const execEngine = new CryptoExecutionEngine(pm, tm, sec, ledger, marketPriceService);
+
+    // Trigger emergency stop
+    sec.triggerEmergencyStop('Security incident test', 'Test-Admin');
+
+    const prep = await execEngine.prepareTransactionIntent({
+      type: 'OUTBOUND_TRANSFER',
+      destination: tm.getTreasuryAddress(),
+      asset: 'SOL',
+      amount: 0.001,
+      purpose: 'Verification transfer during stop'
+    });
+
+    if (prep.intent.policy_status !== 'BLOCKED') {
+      throw new Error('Transaction must be BLOCKED when Emergency Stop is engaged');
+    }
+
+    // Reset emergency stop
+    sec.disengageEmergencyStop('Test-Admin');
+  });
+
+  // 20. Inbound Payment Engine: Order Generation with Unique Reference Key
+  await runTest('20. Inbound Payment Engine: Order generation with Solana reference key & catalog', async () => {
+    const pm = new SolanaProviderManager();
+    const tm = new CentralizedTreasuryManager();
+    const sec = new SecurityGuard();
+    const ledger = new RevenueLedger();
+    const paymentEngine = new InboundPaymentEngine(pm, tm, ledger, marketPriceService, sec);
+
+    const prods = paymentEngine.getProducts();
+    if (prods.length === 0) throw new Error('Product catalog must not be empty');
+
+    const orderRes = await paymentEngine.createOrder({
+      productId: 'prod-mainnet-test',
+      customerWallet: 'HKjCGdas7CVkSwQHi6Bhckj2U2P8rtTyMbikdY5pkXcb'
+    });
+
+    if (!orderRes.order) throw new Error('Failed to create order');
+    if (orderRes.order.status !== 'AWAITING_PAYMENT') throw new Error('New order must be AWAITING_PAYMENT');
+    if (!orderRes.paymentInstructions.referenceKey) throw new Error('Missing reference key in payment instructions');
+    if (!orderRes.paymentInstructions.solanaPayUrl.startsWith('solana:')) throw new Error('Invalid Solana Pay URL');
+  });
+
+  // 21. Replay Protection: Rejection of Already Consumed Signatures
+  await runTest('21. Payment Replay Protection: Rejection of already consumed signatures', async () => {
+    const pm = new SolanaProviderManager();
+    const tm = new CentralizedTreasuryManager();
+    const sec = new SecurityGuard();
+    const ledger = new RevenueLedger();
+    const paymentEngine = new InboundPaymentEngine(pm, tm, ledger, marketPriceService, sec);
+
+    const orderRes1 = await paymentEngine.createOrder({ productId: 'prod-mainnet-test' });
+    const orderRes2 = await paymentEngine.createOrder({ productId: 'prod-mainnet-test' });
+
+    const duplicateSig = '5KFakeDuplicateSignature' + Date.now();
+    // Simulate consuming duplicateSig in evidence
+    (paymentEngine as any).paymentEvidenceMap.set(duplicateSig, {
+      id: 'ev-test',
+      order_id: orderRes1.order.order_id,
+      transaction_signature: duplicateSig,
+      amount: 0.0005
+    });
+
+    const verifyAttempt = await paymentEngine.verifyAndSettlePayment({
+      orderId: orderRes2.order.order_id,
+      transactionSignature: duplicateSig
+    });
+
+    if (verifyAttempt.success) {
+      throw new Error('Replay attack was not blocked; consumed signature was accepted');
+    }
+  });
+
+  // 22. Treasury Cryptographic Reconciliation Report
+  await runTest('22. Treasury Reconciliation: Multi-source audit (RPC, Ledger, Orders)', async () => {
+    const pm = new SolanaProviderManager();
+    const tm = new CentralizedTreasuryManager();
+    const sec = new SecurityGuard();
+    const ledger = new RevenueLedger();
+    const paymentEngine = new InboundPaymentEngine(pm, tm, ledger, marketPriceService, sec);
+    const recService = new TreasuryReconciliationService(pm, tm, ledger, paymentEngine, marketPriceService, sec);
+
+    const report = await recService.runReconciliation();
+    if (!report) throw new Error('Reconciliation report was not generated');
+    if (typeof report.discrepancyUsd !== 'number') throw new Error('Missing discrepancyUsd in report');
+    if (!['BALANCED', 'RECONCILIATION_REQUIRED'].includes(report.reconciliationStatus)) {
+      throw new Error('Invalid reconciliation status');
+    }
   });
 
   const passedCount = results.filter(r => r.passed).length;

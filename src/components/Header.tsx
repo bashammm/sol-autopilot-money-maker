@@ -11,7 +11,9 @@ import {
   Layers,
   Wallet,
   Globe,
-  TrendingUp
+  TrendingUp,
+  ShoppingBag,
+  Scale
 } from 'lucide-react';
 import { CurrentPredicament, SystemSecurityState, MarketPriceInfo } from '../types/yabbai';
 
@@ -31,6 +33,8 @@ interface HeaderProps {
   connectedPhantomAddress?: string;
   onConnectPhantom?: () => void;
   onOpenWithdrawModal?: () => void;
+  onOpenStore?: () => void;
+  onOpenReconciliation?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -49,6 +53,8 @@ export const Header: React.FC<HeaderProps> = ({
   connectedPhantomAddress,
   onConnectPhantom,
   onOpenWithdrawModal,
+  onOpenStore,
+  onOpenReconciliation,
 }) => {
   return (
     <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur px-4 lg:px-8 py-3 transition-colors">
@@ -165,6 +171,32 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
+          {/* Storefront & Inbound Revenue */}
+          {onOpenStore && (
+            <button
+              id="btn-header-store"
+              onClick={onOpenStore}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 transition cursor-pointer shadow-sm"
+              title="Open Storefront & Inbound Revenue Checkout"
+            >
+              <ShoppingBag className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Storefront</span>
+            </button>
+          )}
+
+          {/* Treasury Reconciliation */}
+          {onOpenReconciliation && (
+            <button
+              id="btn-header-reconciliation"
+              onClick={onOpenReconciliation}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border border-blue-500/30 transition cursor-pointer"
+              title="Treasury Reconciliation & Policy Audit"
+            >
+              <Scale className="w-3.5 h-3.5 text-blue-400" />
+              <span>Reconcile</span>
+            </button>
+          )}
+
           {/* Verification Tests */}
           <button
             id="btn-run-tests"
@@ -172,7 +204,7 @@ export const Header: React.FC<HeaderProps> = ({
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 transition cursor-pointer"
           >
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Audit &amp; Tests (16)</span>
+            <span>Audit &amp; Tests (22)</span>
           </button>
 
           {/* Immutable Audit Log */}

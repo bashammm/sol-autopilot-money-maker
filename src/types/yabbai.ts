@@ -438,6 +438,8 @@ export interface TreasurySignerInfo {
   signerType: 'SERVER_SIDE_AA_KEYPAIR';
 }
 
+export type TreasurySignerStatus = TreasurySignerInfo;
+
 export interface ProfitSweepStatus {
   targetWallet: string;
   profitPercent: number;
@@ -456,4 +458,196 @@ export interface ProfitSweepStatus {
   modeExplanation?: string;
   treasurySigner?: TreasurySignerInfo;
 }
+
+// ==========================================
+// CANONICAL CRYPTO EXECUTION & SETTLEMENT TYPES
+// ==========================================
+
+export interface TreasuryConfig {
+  address: string;
+  network: 'mainnet-beta' | 'devnet' | 'simulation';
+  enabled: boolean;
+  allowed_assets: string[];
+  daily_limit: number;
+  per_transaction_limit: number;
+  weekly_limit: number;
+  created_at: number;
+  updated_at: number;
+  destinationAllowlist: string[];
+  destinationBlocklist: string[];
+  spendingTracker: {
+    verifiedDailySpendUsd: number;
+    verifiedWeeklySpendUsd: number;
+    lastResetTimestamp: number;
+  };
+}
+
+export type PhantomConnectionStatus = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
+
+export interface PhantomWalletState {
+  connected: boolean;
+  status: PhantomConnectionStatus;
+  address: string | null;
+  network: 'mainnet-beta' | 'devnet' | 'simulation';
+  balanceSol: number;
+  balanceUsd: number;
+  tokenBalances: Array<{ mint: string; symbol: string; amount: number; decimals: number }>;
+  lastUpdated: number;
+  error?: string | null;
+}
+
+export type TransactionIntentType = 
+  | 'OUTBOUND_TRANSFER'
+  | 'STRATEGY_ALLOCATION'
+  | 'TREASURY_SWEEP'
+  | 'PROFIT_DISTRIBUTION'
+  | 'CUSTOMER_REFUND';
+
+export type PolicyStatus = 
+  | 'APPROVED'
+  | 'BLOCKED'
+  | 'REQUIRES_SIGNATURE'
+  | 'REQUIRES_APPROVAL';
+
+export type CanonicalTxStatus = 
+  | 'PREPARED'
+  | 'POLICY_APPROVED'
+  | 'AWAITING_SIGNATURE'
+  | 'SIGNED'
+  | 'SUBMITTED'
+  | 'CONFIRMING'
+  | 'FINALIZED'
+  | 'FAILED'
+  | 'USER_REJECTED';
+
+export interface TransactionIntent {
+  id: string;
+  type: TransactionIntentType;
+  network: 'mainnet-beta' | 'devnet' | 'simulation';
+  source_wallet: string;
+  destination: string;
+  asset: string;
+  mint: string;
+  amount: number;
+  decimals: number;
+  purpose: string;
+  agent_id?: string;
+  strategy_id?: string;
+  business_id?: string;
+  order_id?: string;
+  policy_status: PolicyStatus;
+  risk_status: 'LOW' | 'MEDIUM' | 'HIGH' | 'BLOCKED';
+  approval_status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  transaction_status: CanonicalTxStatus;
+  created_at: number;
+  expires_at: number;
+  rawTransactionBase64?: string;
+  recentBlockhash?: string;
+  txSignature?: string;
+  solscanUrl?: string;
+  feeLamports?: number;
+  slotConfirmed?: number;
+  blockTime?: number;
+  error?: string;
+  policyFailureReason?: string;
+}
+
+export interface Product {
+  id: string;
+  sku: string;
+  name: string;
+  description: string;
+  category: string;
+  priceSol: number;
+  priceUsd: number;
+  asset: 'SOL' | 'USDC';
+  mint: string;
+  isLive: boolean;
+  isTestProduct?: boolean;
+  fulfillmentType: 'API_TOKEN' | 'SECURITY_REPORT' | 'ALPHA_TELEMETRY' | 'DATA_FEED';
+}
+
+export type OrderPaymentStatus = 
+  | 'ORDER_CREATED'
+  | 'PAYMENT_REQUEST_CREATED'
+  | 'AWAITING_PAYMENT'
+  | 'CHAIN_MONITORING'
+  | 'TRANSACTION_DETECTED'
+  | 'PAYMENT_VERIFYING'
+  | 'PAYMENT_VERIFIED'
+  | 'UNDERPAID'
+  | 'WRONG_RECIPIENT'
+  | 'WRONG_ASSET'
+  | 'EXPIRED'
+  | 'FULFILLMENT'
+  | 'COMPLETED'
+  | 'FAILED';
+
+export interface CustomerOrder {
+  order_id: string;
+  customer_id: string;
+  customer_wallet?: string;
+  product_id: string;
+  product_name: string;
+  asset: string;
+  mint: string;
+  amountDue: number;
+  amountDueUsd: number;
+  amountPaid?: number;
+  recipientTreasuryAddress: string;
+  referenceKey: string;
+  network: 'mainnet-beta' | 'devnet';
+  status: OrderPaymentStatus;
+  created_at: number;
+  expires_at: number;
+  transaction_signature?: string;
+  evidence_id?: string;
+  fulfillment?: {
+    fulfilledAt: number;
+    deliverableType: string;
+    deliverableContent: string;
+    accessKey?: string;
+    solscanUrl?: string;
+  };
+  error_reason?: string;
+}
+
+export interface PaymentEvidence {
+  id: string;
+  order_id: string;
+  transaction_signature: string;
+  sender: string;
+  recipient: string;
+  asset: string;
+  mint: string;
+  amount: number;
+  amountUsd: number;
+  slot: number;
+  block_time: number;
+  verification_status: 'VERIFIED' | 'FAILED' | 'UNDERPAID' | 'WRONG_RECIPIENT' | 'WRONG_ASSET';
+  verification_method: 'ON_CHAIN_TRANSACTION_QUERY';
+  raw_reference: string;
+  verified_at: number;
+  solscanUrl: string;
+  network: 'mainnet-beta' | 'devnet';
+}
+
+export interface TreasuryReconciliationReport {
+  id: string;
+  timestamp: number;
+  network: string;
+  onChainBalanceSol: number;
+  onChainBalanceUsd: number;
+  ledgerBalanceUsd: number;
+  discrepancyUsd: number;
+  totalVerifiedInboundOrders: number;
+  totalVerifiedInboundRevenueUsd: number;
+  totalOutboundDisbursementsUsd: number;
+  unmatchedInboundCount: number;
+  unmatchedInboundSignatures: string[];
+  unmatchedOutboundCount: number;
+  reconciliationStatus: 'BALANCED' | 'RECONCILIATION_REQUIRED';
+  alerts: string[];
+}
+
 

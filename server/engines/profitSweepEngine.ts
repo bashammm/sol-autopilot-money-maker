@@ -114,6 +114,15 @@ export class ProfitSweepEngine {
     this.startRunner();
   }
 
+  public reset() {
+    this.totalSweptUsd = 0;
+    this.totalSweptSol = 0;
+    this.sweepsHistory = [];
+    this.lastSweepAt = 0;
+    this.lastEvaluatedProfitUsd = 0;
+    this.nextSweepAt = Date.now() + this.intervalMs;
+  }
+
   /**
    * Execute 10% Profit Sweep to Target Wallet
    */
@@ -122,25 +131,28 @@ export class ProfitSweepEngine {
       // 1. Calculate realized profit since last evaluation
       const currentRealizedTotal = this.revenueLedger.getRealizedRevenueTotalUsd();
       const deltaProfit = Math.max(0, currentRealizedTotal - this.lastEvaluatedProfitUsd);
+      const buckets = this.revenueLedger.getCapitalBuckets();
+      const availableTreasury = buckets.treasuryReserveUsd || 0;
       
-      // Calculate 10% of profit. If delta is small (e.g. system just started), allocate from available treasury capital
       let amountUsd = forcedAmountUsd;
       if (!amountUsd) {
         if (deltaProfit > 0) {
           amountUsd = Math.round(deltaProfit * (this.profitPercent / 100) * 100) / 100;
+        } else if (availableTreasury > 0) {
+          amountUsd = Math.round(availableTreasury * (this.profitPercent / 100) * 100) / 100;
         } else {
-          // Dynamic calculation: 10% of typical 5-min batch profit yield (~$18.50 - $42.00)
-          const baseBatchYield = 18.50 + (Math.floor(Date.now() / 10000) % 24);
-          amountUsd = Math.round(baseBatchYield * (this.profitPercent / 100) * 100) / 100;
+          amountUsd = 0;
         }
       }
 
-      const buckets = this.revenueLedger.getCapitalBuckets();
-      const availableTreasury = buckets.treasuryReserveUsd || 50;
+      if (amountUsd <= 0 || availableTreasury <= 0) {
+        this.nextSweepAt = Date.now() + this.intervalMs;
+        return null;
+      }
 
       // Ensure we don't exceed available treasury reserve
       if (amountUsd > availableTreasury) {
-        amountUsd = Math.max(1.00, Math.round(availableTreasury * 0.10 * 100) / 100);
+        amountUsd = Math.round(availableTreasury * (this.profitPercent / 100) * 100) / 100;
       }
 
       if (amountUsd <= 0) {
@@ -153,21 +165,18 @@ export class ProfitSweepEngine {
       const solPrice = priceData.solPriceUsd > 0 ? priceData.solPriceUsd : 96.80;
       const amountSol = Math.round((amountUsd / solPrice) * 1e6) / 1e6;
 
-      // 3. Fetch latest on-chain blockhash from active Helius / QuickNode / Alchemy RPC
-      let latestBlockhash = '';
-      try {
-        const blockhashInfo = await this.solanaProvider.getLatestBlockhash();
-        latestBlockhash = blockhashInfo.blockhash;
-      } catch {
-        latestBlockhash = '3tft7kUGi77FfhqXyiDZC2h6mLBcZ4C2yUKTSvFhfDuG';
+      // 3. Attempt real on-chain transfer via Solana provider
+      const realTxResult = await this.solanaProvider.sendRealSolTransfer(this.targetWallet, amountSol);
+      if (!realTxResult.success || !realTxResult.signature) {
+        // Do not fabricate fake simulated sweep records when on-chain funds are not present
+        this.nextSweepAt = Date.now() + this.intervalMs;
+        return null;
       }
 
-      // 4. Attempt real on-chain transfer if funded signer is available
-      const realTxResult = await this.solanaProvider.sendRealSolTransfer(this.targetWallet, amountSol);
-      const isRealOnChain = Boolean(realTxResult.success && realTxResult.signature);
-      const sweepId = isRealOnChain ? realTxResult.signature! : `internal-sweep-${Date.now()}`;
+      const isRealOnChain = true;
+      const sweepId = realTxResult.signature;
 
-      // 5. Deduct from treasury and record official withdrawal record
+      // 4. Deduct from treasury and record official withdrawal record
       const record = this.revenueLedger.withdrawFromTreasury({
         amountUsd,
         recipientAddress: this.targetWallet,
@@ -175,18 +184,14 @@ export class ProfitSweepEngine {
         solPriceUsd: solPrice,
         sourceBucket: 'treasuryReserveUsd',
         userSignature: sweepId,
-        note: isRealOnChain 
-          ? `Live On-Chain 10% Profit Sweep to ${this.targetWallet.slice(0, 4)}...${this.targetWallet.slice(-4)}`
-          : `Simulated 10% Profit Sweep (Ledger) to ${this.targetWallet.slice(0, 4)}...${this.targetWallet.slice(-4)}`
+        note: `Live On-Chain 10% Profit Sweep to ${this.targetWallet.slice(0, 4)}...${this.targetWallet.slice(-4)}`
       });
 
       // Augment record with mode & verification
       record.onChainVerified = isRealOnChain;
-      record.disbursementMode = isRealOnChain ? 'REAL_ON_CHAIN' : 'SIMULATION_LEDGER';
+      record.disbursementMode = 'REAL_ON_CHAIN';
       record.transactionSignature = sweepId;
-      record.solscanUrl = isRealOnChain 
-        ? `https://solscan.io/tx/${sweepId}` 
-        : `https://solscan.io/account/${this.targetWallet}`;
+      record.solscanUrl = `https://solscan.io/tx/${sweepId}`;
       record.accountUrl = `https://solscan.io/account/${this.targetWallet}`;
       record.cluster = this.solanaProvider.getCluster();
 

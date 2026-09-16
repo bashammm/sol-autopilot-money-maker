@@ -83,17 +83,6 @@ export class SolanaProviderManager {
 
     this.providers = [
       {
-        id: 'helius',
-        name: 'Helius RPC High-Performance',
-        url: hel,
-        isCustomKey: true,
-        latencyMs: 34,
-        errorCount: 0,
-        successCount: 350,
-        lastChecked: Date.now(),
-        isHealthy: true
-      },
-      {
         id: 'quicknode',
         name: 'QuickNode Solana Dedicated',
         url: qn,
@@ -116,13 +105,13 @@ export class SolanaProviderManager {
         isHealthy: true
       },
       {
-        id: 'mainnet-public',
-        name: 'Solana Foundation Public RPC',
-        url: custom || (this.cluster === 'devnet' ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com'),
-        isCustomKey: !!custom,
-        latencyMs: 65,
+        id: 'helius',
+        name: 'Helius RPC High-Performance',
+        url: hel,
+        isCustomKey: true,
+        latencyMs: 34,
         errorCount: 0,
-        successCount: 150,
+        successCount: 350,
         lastChecked: Date.now(),
         isHealthy: true
       }
@@ -138,13 +127,6 @@ export class SolanaProviderManager {
 
   public setCluster(cluster: 'mainnet-beta' | 'devnet') {
     this.cluster = cluster;
-    if (cluster === 'devnet') {
-      this.providers[0].url = 'https://api.devnet.solana.com';
-      this.providers[0].name = 'Solana Devnet RPC';
-    } else {
-      this.providers[0].url = 'https://api.mainnet-beta.solana.com';
-      this.providers[0].name = 'Solana Foundation Public RPC';
-    }
     this.connectionCache.clear();
   }
 
@@ -528,10 +510,11 @@ export class SolanaProviderManager {
       // Check if server hot wallet has enough SOL to execute on-chain
       if (currentBalance * LAMPORTS_PER_SOL < lamportsToSend + estFeeLamports) {
         return {
-          success: true,
-          mode: 'SIMULATION_LEDGER',
+          success: false,
+          mode: 'REAL_ON_CHAIN',
           signerPublicKey: signerPubkey,
-          explanation: `Server AA Signer (${signerPubkey.slice(0, 4)}...${signerPubkey.slice(-4)}) has ${currentBalance.toFixed(6)} SOL (requires ${amountSol.toFixed(4)} SOL + fee for live mainnet transfer). Settled in strategy ledger. Deposit SOL to ${signerPubkey} to activate live transfers.`
+          error: 'INSUFFICIENT_ON_CHAIN_TREASURY_FUNDS',
+          explanation: `On-chain Treasury Vault (${signerPubkey.slice(0, 4)}...${signerPubkey.slice(-4)}) has ${currentBalance.toFixed(6)} SOL. Requested withdrawal: ${amountSol.toFixed(4)} SOL + network fee. Live on-chain transfer requires real funds in the Treasury Vault. Deposit SOL to ${signerPubkey} on ${this.cluster} to execute.`
         };
       }
 
@@ -560,11 +543,53 @@ export class SolanaProviderManager {
     } catch (err: any) {
       console.error('[SolanaProviderManager] Real transfer broadcast error:', err.message);
       return {
-        success: true,
-        mode: 'SIMULATION_LEDGER',
+        success: false,
+        mode: 'REAL_ON_CHAIN',
         signerPublicKey: signerPubkey,
         error: err.message,
-        explanation: `Live broadcast error (${err.message}). Safely settled in strategy ledger.`
+        explanation: `Live broadcast error on Solana ${this.cluster}: ${err.message}`
+      };
+    }
+  }
+
+  /**
+   * Request Devnet test SOL airdrop to test real on-chain transfers
+   */
+  public async requestDevnetAirdrop(address: string, amountSol: number = 0.5): Promise<{
+    success: boolean;
+    signature?: string;
+    error?: string;
+    solscanUrl?: string;
+    newBalanceSol?: number;
+  }> {
+    if (this.cluster !== 'devnet') {
+      return {
+        success: false,
+        error: 'Airdrop is only supported on Solana Devnet. Please switch cluster to Devnet first.'
+      };
+    }
+    try {
+      const conn = this.getConnection();
+      const pubkey = new PublicKey(address);
+      const lamports = Math.floor(amountSol * LAMPORTS_PER_SOL);
+      const sig = await conn.requestAirdrop(pubkey, lamports);
+      const latestBlockhash = await conn.getLatestBlockhash();
+      await conn.confirmTransaction({
+        signature: sig,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+      }, 'confirmed');
+      const newBal = await this.getBalanceSol(address);
+      return {
+        success: true,
+        signature: sig,
+        solscanUrl: `https://solscan.io/tx/${sig}?cluster=devnet`,
+        newBalanceSol: newBal
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: `Devnet airdrop failed (${err.message}). Solana public faucets may be temporarily rate-limited; you can also request test SOL at https://faucet.solana.com.`
       };
     }
   }

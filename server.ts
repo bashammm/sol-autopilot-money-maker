@@ -23,6 +23,10 @@ import { YABBAI_POSTGRES_SCHEMA_SQL } from './server/db/schema';
 import { AutopilotEngine } from './server/engines/autopilotEngine';
 import { ProfitSweepEngine } from './server/engines/profitSweepEngine';
 import { marketPriceService } from './server/solana/priceService';
+import { CentralizedTreasuryManager } from './server/solana/treasuryConfig';
+import { CryptoExecutionEngine } from './server/solana/cryptoExecutionEngine';
+import { InboundPaymentEngine } from './server/engines/paymentEngine';
+import { TreasuryReconciliationService } from './server/engines/treasuryReconciliation';
 
 // Test runner import
 import { runAllVerificationTests } from './test/test-suite';
@@ -36,14 +40,37 @@ async function startServer() {
 
   // Initialize Core Engines
   const providerManager = new SolanaProviderManager();
+  const treasuryManager = new CentralizedTreasuryManager();
+  const securityGuard = new SecurityGuard();
+  const revenueLedger = new RevenueLedger();
+  const paymentEngine = new InboundPaymentEngine(
+    providerManager,
+    treasuryManager,
+    revenueLedger,
+    marketPriceService,
+    securityGuard
+  );
+  const cryptoExecutionEngine = new CryptoExecutionEngine(
+    providerManager,
+    treasuryManager,
+    securityGuard,
+    revenueLedger,
+    marketPriceService
+  );
+  const reconciliationService = new TreasuryReconciliationService(
+    providerManager,
+    treasuryManager,
+    revenueLedger,
+    paymentEngine,
+    marketPriceService,
+    securityGuard
+  );
   const txStateMachine = new TransactionStateMachine(providerManager);
   const opportunityRegistry = new OpportunityRegistry();
   const fleetEngine = new FleetEngine();
   const strategyRegistry = new StrategyRegistry();
-  const revenueLedger = new RevenueLedger();
   const treasurySquads = new TreasurySquadsEngine();
   const taskQueue = new EarningTaskQueue();
-  const securityGuard = new SecurityGuard();
   const storageEngine = new StorageEngine();
   const autopilotEngine = new AutopilotEngine({
     fleetEngine,
@@ -96,12 +123,17 @@ async function startServer() {
 
   // System Summary & Predicament Status
   app.get('/api/status', async (req: Request, res: Response) => {
+    const livePrice = await marketPriceService.getSolPrice();
+    const signerStatus = await providerManager.getTreasurySignerStatus();
+    
+    // Sync revenue ledger Treasury Reserve with real on-chain vault balance
+    revenueLedger.syncWithOnChainBalance(signerStatus.balanceSol, livePrice.solPriceUsd);
+
     const buckets = revenueLedger.getCapitalBuckets();
     const gasBalanceSol = fleetEngine.getAllAgents().reduce((acc, a) => acc + a.budget.currentGasBalanceSol, 0);
     const predicament = CurrentPredicamentEngine.evaluate(buckets.totalVerifiedCapitalUsd, gasBalanceSol);
     const secState = securityGuard.getSecurityState();
     const activeProvider = providerManager.getActiveProvider();
-    const livePrice = await marketPriceService.getSolPrice();
 
     res.json({
       status: 'ONLINE',
@@ -116,10 +148,77 @@ async function startServer() {
       activeProvider: { name: activeProvider.name, id: activeProvider.id },
       autopilot: autopilotEngine.getStatus(),
       profitSweep: profitSweepEngine.getStatus(),
-      treasurySigner: await providerManager.getTreasurySignerStatus(),
+      treasurySigner: signerStatus,
       cluster: providerManager.getCluster(),
       solPrice: livePrice
     });
+  });
+
+  // Reset System & Clean Start (Purge fake balance, start clean from real on-chain balance)
+  app.post('/api/system/reset-clean-start', async (req: Request, res: Response) => {
+    try {
+      revenueLedger.resetAll();
+      autopilotEngine.reset();
+      profitSweepEngine.reset();
+
+      const livePrice = await marketPriceService.getSolPrice();
+      const signerStatus = await providerManager.getTreasurySignerStatus();
+      revenueLedger.syncWithOnChainBalance(signerStatus.balanceSol, livePrice.solPriceUsd);
+
+      const buckets = revenueLedger.getCapitalBuckets();
+      const gasBalanceSol = fleetEngine.getAllAgents().reduce((acc, a) => acc + a.budget.currentGasBalanceSol, 0);
+      const predicament = CurrentPredicamentEngine.evaluate(buckets.totalVerifiedCapitalUsd, gasBalanceSol);
+
+      securityGuard.recordAudit({
+        actor: 'ADMIN_USER',
+        action: 'SYSTEM_RESET_CLEAN_START',
+        resourceId: 'revenue_ledger',
+        details: {
+          purgedMockBalances: true,
+          currentTreasurySigner: signerStatus.publicKey,
+          currentTreasuryBalanceSol: signerStatus.balanceSol
+        }
+      });
+
+      res.json({
+        success: true,
+        message: 'System reset successful. All simulated balances purged. Clean start initialized with verified on-chain treasury funds.',
+        capitalBuckets: buckets,
+        predicament,
+        treasurySigner: signerStatus
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Request Devnet SOL Airdrop for Testing Real On-Chain Transactions
+  app.post('/api/solana/airdrop-devnet', async (req: Request, res: Response) => {
+    try {
+      const { address, amountSol } = req.body;
+      const targetAddress = address || providerManager.getTreasuryKeypair().publicKey.toBase58();
+      const amount = Number(amountSol) || 0.5;
+
+      const result = await providerManager.requestDevnetAirdrop(targetAddress, amount);
+      if (!result.success) {
+        return res.status(400).json({ error: result.error });
+      }
+
+      // Sync ledger with new balance
+      const livePrice = await marketPriceService.getSolPrice();
+      const signerStatus = await providerManager.getTreasurySignerStatus();
+      revenueLedger.syncWithOnChainBalance(signerStatus.balanceSol, livePrice.solPriceUsd);
+
+      res.json({
+        success: true,
+        signature: result.signature,
+        solscanUrl: result.solscanUrl,
+        newBalanceSol: result.newBalanceSol,
+        targetAddress
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // Real-time Solana Market Price & On-chain RPC Endpoints
@@ -676,84 +775,111 @@ async function startServer() {
 
       const priceData = await marketPriceService.getSolPrice();
 
-      // Check if real on-chain broadcast is possible via server signer
-      let realTxResult: {
-        success: boolean;
-        signature?: string;
-        mode: 'REAL_ON_CHAIN' | 'SIMULATION_LEDGER';
-        error?: string;
-        explanation?: string;
-      } = { success: false, mode: 'SIMULATION_LEDGER' };
+      // Live on-chain withdrawal execution
       if (asset !== 'USDC') {
         const estSol = Math.round((Number(amountUsd) / priceData.solPriceUsd) * 1e6) / 1e6;
-        realTxResult = await providerManager.sendRealSolTransfer(String(recipientAddress), estSol);
-      }
+        const signerStatus = await providerManager.getTreasurySignerStatus();
+        
+        // Strictly verify that the on-chain vault has sufficient real SOL
+        if (signerStatus.balanceSol < estSol) {
+          return res.status(400).json({
+            error: 'INSUFFICIENT_ON_CHAIN_TREASURY_FUNDS',
+            message: `On-chain Treasury Vault has ${signerStatus.balanceSol.toFixed(6)} SOL ($${(signerStatus.balanceSol * priceData.solPriceUsd).toFixed(2)} USD). Requested withdrawal is ${estSol.toFixed(4)} SOL ($${Number(amountUsd).toFixed(2)} USD). Real on-chain transfers require physical funds in the Treasury Signer address.`,
+            treasurySignerAddress: signerStatus.publicKey,
+            vaultBalanceSol: signerStatus.balanceSol,
+            vaultBalanceUsd: Math.round(signerStatus.balanceSol * priceData.solPriceUsd * 100) / 100,
+            requestedSol: estSol,
+            cluster: providerManager.getCluster(),
+            suggestDeposit: true
+          });
+        }
 
-      const txSig = (realTxResult.success && realTxResult.signature) ? realTxResult.signature : (userSignature || `internal-${Date.now()}`);
+        const realTxResult = await providerManager.sendRealSolTransfer(String(recipientAddress), estSol);
+        if (!realTxResult.success || !realTxResult.signature) {
+          return res.status(400).json({
+            error: 'ON_CHAIN_BROADCAST_FAILED',
+            message: realTxResult.explanation || realTxResult.error || 'Failed to broadcast transaction to Solana network',
+            treasurySignerAddress: signerStatus.publicKey,
+            cluster: providerManager.getCluster()
+          });
+        }
 
-      const record = revenueLedger.withdrawFromTreasury({
-        amountUsd: Number(amountUsd),
-        recipientAddress: String(recipientAddress),
-        asset: asset === 'USDC' ? 'USDC' : 'SOL',
-        solPriceUsd: priceData.solPriceUsd,
-        sourceBucket: sourceBucket || 'treasuryReserveUsd',
-        userSignature: txSig,
-        note
-      });
+        const txSig = realTxResult.signature;
+        const record = revenueLedger.withdrawFromTreasury({
+          amountUsd: Number(amountUsd),
+          recipientAddress: String(recipientAddress),
+          asset: 'SOL',
+          solPriceUsd: priceData.solPriceUsd,
+          sourceBucket: sourceBucket || 'treasuryReserveUsd',
+          userSignature: txSig,
+          onChainAvailableUsd: signerStatus.balanceSol * priceData.solPriceUsd,
+          note: note || `Live On-Chain Transfer to ${recipientAddress.slice(0, 4)}...${recipientAddress.slice(-4)}`
+        });
 
-      record.disbursementMode = (realTxResult.success && realTxResult.signature) ? 'REAL_ON_CHAIN' : 'SIMULATION_LEDGER';
-      record.onChainVerified = Boolean(realTxResult.success && realTxResult.signature);
-      if (realTxResult.success && realTxResult.signature) {
-        record.transactionSignature = realTxResult.signature;
-        record.solscanUrl = `https://solscan.io/tx/${realTxResult.signature}`;
+        record.disbursementMode = 'REAL_ON_CHAIN';
+        record.onChainVerified = true;
+        record.transactionSignature = txSig;
+        record.solscanUrl = providerManager.getCluster() === 'devnet'
+          ? `https://solscan.io/tx/${txSig}?cluster=devnet`
+          : `https://solscan.io/tx/${txSig}`;
+
+        // Non-custodial state machine tracking
+        txStateMachine.processIntent({
+          id: `tx-withdraw-${Date.now()}`,
+          agentId: 'treasury-vault-payout',
+          targetRecipient: String(recipientAddress),
+          amountLamports: Math.round(estSol * 1e9),
+          strategyCategory: 'treasury_reporting',
+          maxSlippageBps: 10,
+          priorityFeeMicroLamports: 1000,
+          instructionType: 'TRANSFER',
+          policyConstraints: {
+            maxLossUsd: 0,
+            requireMultisig: false,
+            zeroCapitalMode: false
+          }
+        }).catch(() => {});
+
+        // Record in immutable cryptographic audit trail
+        securityGuard.recordAudit({
+          actor: String(recipientAddress),
+          action: 'TREASURY_WITHDRAWAL_TO_PHANTOM',
+          resourceId: record.id,
+          details: {
+            recipientAddress,
+            amountUsd: record.amountUsd,
+            amountAsset: record.amountAsset,
+            asset: 'SOL',
+            signature: record.transactionSignature,
+            sourceBucket: record.sourceBucket,
+            vault: record.squadsVaultAddress
+          }
+        });
+
+        // Re-sync with on-chain balance
+        const updatedSigner = await providerManager.getTreasurySignerStatus();
+        revenueLedger.syncWithOnChainBalance(updatedSigner.balanceSol, priceData.solPriceUsd);
+        const buckets = revenueLedger.getCapitalBuckets();
+        const gasBalanceSol = fleetEngine.getAllAgents().reduce((acc, a) => acc + a.budget.currentGasBalanceSol, 0);
+        const updatedPredicament = CurrentPredicamentEngine.evaluate(buckets.totalVerifiedCapitalUsd, gasBalanceSol);
+
+        return res.json({
+          success: true,
+          mode: 'REAL_ON_CHAIN',
+          withdrawal: record,
+          signature: txSig,
+          solscanUrl: record.solscanUrl,
+          capitalBuckets: buckets,
+          predicament: updatedPredicament,
+          remainingTreasuryUsd: buckets.treasuryReserveUsd
+        });
       } else {
-        record.solscanUrl = `https://solscan.io/account/${recipientAddress}`;
+        // USDC withdrawal requires SPL token transfer
+        return res.status(400).json({
+          error: 'USDC_DIRECT_TRANSFER_NOT_SUPPORTED',
+          message: 'Real on-chain withdrawals currently support native SOL. Please select SOL as withdrawal asset.'
+        });
       }
-
-      // Non-custodial state machine tracking
-      txStateMachine.processIntent({
-        id: `tx-withdraw-${Date.now()}`,
-        agentId: 'treasury-vault-payout',
-        targetRecipient: String(recipientAddress),
-        amountLamports: record.asset === 'SOL' ? Math.round(record.amountAsset * 1e9) : 0,
-        strategyCategory: 'treasury_reporting',
-        maxSlippageBps: 10,
-        priorityFeeMicroLamports: 1000,
-        instructionType: 'TRANSFER',
-        policyConstraints: {
-          maxLossUsd: 0,
-          requireMultisig: false,
-          zeroCapitalMode: false
-        }
-      }).catch(() => {});
-
-      // Record in immutable cryptographic audit trail
-      securityGuard.recordAudit({
-        actor: String(recipientAddress),
-        action: 'TREASURY_WITHDRAWAL_TO_PHANTOM',
-        resourceId: record.id,
-        details: {
-          recipientAddress,
-          amountUsd: record.amountUsd,
-          amountAsset: record.amountAsset,
-          asset: record.asset,
-          signature: record.transactionSignature,
-          sourceBucket: record.sourceBucket,
-          vault: record.squadsVaultAddress
-        }
-      });
-
-      const buckets = revenueLedger.getCapitalBuckets();
-      const gasBalanceSol = fleetEngine.getAllAgents().reduce((acc, a) => acc + a.budget.currentGasBalanceSol, 0);
-      const updatedPredicament = CurrentPredicamentEngine.evaluate(buckets.totalVerifiedCapitalUsd, gasBalanceSol);
-
-      res.json({
-        success: true,
-        withdrawal: record,
-        capitalBuckets: buckets,
-        predicament: updatedPredicament,
-        remainingTreasuryUsd: buckets.treasuryReserveUsd
-      });
     } catch (err: any) {
       res.status(400).json({ error: err.message });
     }
@@ -852,6 +978,152 @@ async function startServer() {
       });
     } catch (err: any) {
       res.status(400).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // CANONICAL CRYPTO EXECUTION & TREASURY CONFIG
+  // ==========================================
+
+  // Treasury Configuration & Limits
+  app.get('/api/treasury/config', (req: Request, res: Response) => {
+    res.json(treasuryManager.getConfig());
+  });
+
+  app.post('/api/treasury/config', (req: Request, res: Response) => {
+    try {
+      const updated = treasuryManager.updateConfig(req.body);
+      securityGuard.recordAudit({
+        actor: 'OPERATOR',
+        action: 'UPDATE_TREASURY_CONFIG',
+        resourceId: updated.address,
+        details: req.body
+      });
+      res.json({ success: true, config: updated });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // Canonical Crypto Execution Flow (Prepare -> Policy -> Sign -> Settle -> Verify)
+  app.get('/api/execution/intents', (req: Request, res: Response) => {
+    res.json({ intents: cryptoExecutionEngine.getAllIntents() });
+  });
+
+  app.get('/api/execution/intents/:id', (req: Request, res: Response) => {
+    const intent = cryptoExecutionEngine.getIntent(req.params.id);
+    if (!intent) return res.status(404).json({ error: 'Intent not found' });
+    res.json(intent);
+  });
+
+  app.post('/api/execution/prepare', async (req: Request, res: Response) => {
+    try {
+      const result = await cryptoExecutionEngine.prepareTransactionIntent({
+        type: req.body.type || 'OUTBOUND_TRANSFER',
+        sourceWallet: req.body.sourceWallet,
+        destination: req.body.destination,
+        asset: req.body.asset || 'SOL',
+        amount: Number(req.body.amount),
+        purpose: req.body.purpose || 'Treasury operation',
+        agentId: req.body.agentId,
+        strategyId: req.body.strategyId,
+        businessId: req.body.businessId,
+        orderId: req.body.orderId
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/execution/submit-signed', async (req: Request, res: Response) => {
+    try {
+      const { intentId, signedTxBase64, signature } = req.body;
+      const result = await cryptoExecutionEngine.submitSignedTransaction(intentId, {
+        signedTxBase64,
+        signature
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/execution/verify-settle', async (req: Request, res: Response) => {
+    try {
+      const { intentId } = req.body;
+      const result = await cryptoExecutionEngine.verifyAndSettleIntent(intentId);
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // Inbound Customer Revenue Engine & Real Products
+  app.get('/api/payments/products', (req: Request, res: Response) => {
+    res.json({ products: paymentEngine.getProducts() });
+  });
+
+  app.get('/api/payments/orders', (req: Request, res: Response) => {
+    res.json({ orders: paymentEngine.getAllOrders() });
+  });
+
+  app.get('/api/payments/orders/:id', (req: Request, res: Response) => {
+    const order = paymentEngine.getOrder(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    res.json(order);
+  });
+
+  app.post('/api/payments/orders', async (req: Request, res: Response) => {
+    try {
+      const { productId, customerWallet, customerId } = req.body;
+      const result = await paymentEngine.createOrder({
+        productId,
+        customerWallet,
+        customerId
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/payments/verify', async (req: Request, res: Response) => {
+    try {
+      const { orderId, transactionSignature } = req.body;
+      if (!orderId || !transactionSignature) {
+        return res.status(400).json({ error: 'orderId and transactionSignature are required' });
+      }
+      const result = await paymentEngine.verifyAndSettlePayment({
+        orderId,
+        transactionSignature
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/payments/evidence', (req: Request, res: Response) => {
+    res.json({ evidence: paymentEngine.getAllEvidence() });
+  });
+
+  // Treasury Cryptographic Reconciliation
+  app.get('/api/treasury/reconciliation', async (req: Request, res: Response) => {
+    try {
+      const report = await reconciliationService.runReconciliation();
+      res.json(report);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/treasury/reconciliation/run', async (req: Request, res: Response) => {
+    try {
+      const report = await reconciliationService.runReconciliation();
+      res.json({ success: true, report });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
   });
 

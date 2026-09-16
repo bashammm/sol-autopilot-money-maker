@@ -11,11 +11,42 @@
  */
 
 import { timingSafeEqual, createHash, randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { AuditLog, SystemSecurityState } from '../../src/types/yabbai';
+
+export interface KeyMigrationStatus {
+  compromisedKeyDetected: boolean;
+  compromisedFilePath?: string;
+  quarantined: boolean;
+  alertMessage: string;
+  migrationProcedure: string[];
+}
 
 export class SecurityGuard {
   private auditTrail: AuditLog[] = [];
   private rateLimitMap: Map<string, { count: number; resetAt: number }> = new Map();
+  private stoppedWallets: Set<string> = new Set();
+  private stoppedAgents: Set<string> = new Set();
+  private stoppedStrategies: Set<string> = new Set();
+  private withdrawalsStopped: boolean = false;
+  private sweepsStopped: boolean = false;
+
+  private keyMigrationState: KeyMigrationStatus = {
+    compromisedKeyDetected: false,
+    quarantined: true,
+    alertMessage: 'No compromised repository keys detected.',
+    migrationProcedure: [
+      '1. Generate a brand new secure production wallet/signer outside git control',
+      '2. Verify its public address on Solana blockchain explorer',
+      '3. Fund with only a micro-test gas deposit (e.g. 0.005 SOL)',
+      '4. Verify on-chain balance via live RPC',
+      '5. Authorize and test signing within strict policy boundaries',
+      '6. Retire and revoke any exposed test keys',
+      '7. Confirm exposed secret files are excluded via .gitignore and absent from source control'
+    ]
+  };
+
   private systemState: SystemSecurityState = {
     emergencyStopEngaged: false,
     totalGlobalExposureUsd: 185.00,
@@ -23,6 +54,18 @@ export class SecurityGuard {
     correlationDetectionScore: 0.04, // Low correlation (healthy independent fleet)
     activeRpcProvider: 'QuickNode Solana Dedicated',
     corsOriginPolicy: 'Restricted-Origin-Strict'
+  };
+
+  // Hard Spending Limits
+  public static readonly POLICY = {
+    MAX_TRANSACTION_VALUE_USD: 100.00,
+    MAX_DAILY_SPEND_USD: 500.00,
+    MAX_WEEKLY_SPEND_USD: 2500.00,
+    MAX_STRATEGY_ALLOCATION_USD: 250.00,
+    MAX_WALLET_EXPOSURE_USD: 500.00,
+    MAX_SLIPPAGE_BPS: 100, // 1%
+    MIN_EXPECTED_NET_RETURN_BPS: 50, // 0.5%
+    MIN_GAS_RESERVE_SOL: 0.005
   };
 
   // Known dangerous mints / scam addresses blacklisted
@@ -33,17 +76,160 @@ export class SecurityGuard {
   ]);
 
   constructor() {
+    this.detectCompromisedKeyFile();
+
     this.recordAudit({
       actor: 'SYSTEM',
       action: 'BOOTSTRAP',
       resourceId: 'SECURITY_ENGINE',
-      details: { status: 'INITIALIZED', rules: 'STRICT_CORS_AND_CORRELATION_GUARD_ENABLED' }
+      details: {
+        status: 'INITIALIZED',
+        rules: 'STRICT_CORS_AND_CORRELATION_GUARD_ENABLED',
+        keyCompromiseDetected: this.keyMigrationState.compromisedKeyDetected
+      }
     });
+  }
+
+  /**
+   * Startup detection: check if repository-local secret key file exists
+   * Treats file as compromised and refuses to automatically use it for production funds.
+   */
+  public detectCompromisedKeyFile(): KeyMigrationStatus {
+    const suspectPaths = [
+      path.join(process.cwd(), '.treasury_keypair.json'),
+      path.join(process.cwd(), 'treasury_keypair.json'),
+      path.join(process.cwd(), 'id.json'),
+      path.join(process.cwd(), 'server/.treasury_keypair.json')
+    ];
+
+    for (const p of suspectPaths) {
+      if (fs.existsSync(p)) {
+        this.keyMigrationState.compromisedKeyDetected = true;
+        this.keyMigrationState.compromisedFilePath = p;
+        this.keyMigrationState.alertMessage = `CRITICAL SECURITY ALERT: Repository-local secret key detected at ${path.basename(p)}. This key is treated as COMPROMISED. It will NOT be used for production funds.`;
+
+        console.error('================================================================');
+        console.error(`[SECURITY ALERT] Compromised secret key file found at ${p}`);
+        console.error('[SECURITY ALERT] Production funds must NEVER use committed or repository-local secret files.');
+        console.error('[SECURITY ALERT] Follow the 7-step key migration procedure.');
+        console.error('================================================================');
+
+        // Quarantine: immediately remove or rename file to prevent accidental reuse
+        try {
+          fs.unlinkSync(p);
+          console.log(`[SECURITY] Quarantined and removed compromised secret key file from ${p}`);
+        } catch {
+          // ignore error if read-only
+        }
+
+        this.recordAudit({
+          actor: 'SYSTEM_SECURITY_STARTUP',
+          action: 'COMPROMISED_KEYPAIR_DETECTED_AND_QUARANTINED',
+          resourceId: path.basename(p),
+          details: {
+            filePath: path.basename(p),
+            quarantined: true,
+            alertMessage: this.keyMigrationState.alertMessage
+          }
+        });
+
+        break;
+      }
+    }
+
+    return this.keyMigrationState;
+  }
+
+  public getKeyMigrationStatus(): KeyMigrationStatus {
+    return { ...this.keyMigrationState };
   }
 
   public getSecurityState(): SystemSecurityState {
     return { ...this.systemState };
   }
+
+  public isWalletStopped(walletAddress: string): boolean {
+    return this.systemState.emergencyStopEngaged || this.stoppedWallets.has(walletAddress.toLowerCase());
+  }
+
+  public isAgentStopped(agentId: string): boolean {
+    return this.systemState.emergencyStopEngaged || this.stoppedAgents.has(agentId.toLowerCase());
+  }
+
+  public isStrategyStopped(strategyId: string): boolean {
+    return this.systemState.emergencyStopEngaged || this.stoppedStrategies.has(strategyId.toLowerCase());
+  }
+
+  public areWithdrawalsStopped(): boolean {
+    return this.systemState.emergencyStopEngaged || this.withdrawalsStopped;
+  }
+
+  public areSweepsStopped(): boolean {
+    return this.systemState.emergencyStopEngaged || this.sweepsStopped;
+  }
+
+  public setWalletStop(walletAddress: string, stopped: boolean, actor: string) {
+    if (stopped) {
+      this.stoppedWallets.add(walletAddress.toLowerCase());
+    } else {
+      this.stoppedWallets.delete(walletAddress.toLowerCase());
+    }
+    this.recordAudit({
+      actor,
+      action: stopped ? 'STOP_WALLET' : 'RESUME_WALLET',
+      resourceId: walletAddress,
+      details: { stopped }
+    });
+  }
+
+  public setAgentStop(agentId: string, stopped: boolean, actor: string) {
+    if (stopped) {
+      this.stoppedAgents.add(agentId.toLowerCase());
+    } else {
+      this.stoppedAgents.delete(agentId.toLowerCase());
+    }
+    this.recordAudit({
+      actor,
+      action: stopped ? 'STOP_AGENT' : 'RESUME_AGENT',
+      resourceId: agentId,
+      details: { stopped }
+    });
+  }
+
+  public setStrategyStop(strategyId: string, stopped: boolean, actor: string) {
+    if (stopped) {
+      this.stoppedStrategies.add(strategyId.toLowerCase());
+    } else {
+      this.stoppedStrategies.delete(strategyId.toLowerCase());
+    }
+    this.recordAudit({
+      actor,
+      action: stopped ? 'STOP_STRATEGY' : 'RESUME_STRATEGY',
+      resourceId: strategyId,
+      details: { stopped }
+    });
+  }
+
+  public setWithdrawalStop(stopped: boolean, actor: string) {
+    this.withdrawalsStopped = stopped;
+    this.recordAudit({
+      actor,
+      action: stopped ? 'STOP_WITHDRAWALS' : 'RESUME_WITHDRAWALS',
+      resourceId: 'WITHDRAWAL_SUBSYSTEM',
+      details: { stopped }
+    });
+  }
+
+  public setSweepStop(stopped: boolean, actor: string) {
+    this.sweepsStopped = stopped;
+    this.recordAudit({
+      actor,
+      action: stopped ? 'STOP_SWEEPS' : 'RESUME_SWEEPS',
+      resourceId: 'SWEEP_SUBSYSTEM',
+      details: { stopped }
+    });
+  }
+
 
   public getAuditTrail(limit: number = 50): AuditLog[] {
     return this.auditTrail.slice(-limit).reverse();

@@ -1,2 +1,29 @@
-# Private repository - all configs and files tracked
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Production build outputs
+dist/
+build/
+
+# Local Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.keypair.json
+.treasury_keypair.json
+.compromised_keys/
+
+# Database and ledger local data
+data/
+*.sqlite
+*.sqlite-journal
+
+# System & IDE files
+.DS_Store
+*.log
+
 

@@ -1,48 +1,58 @@
 /**
  * YABBAI - Autonomous Autopilot Execution Engine
- * Continuously evaluates, quotes, authorizes, executes, verifies, and accounts
- * for on-chain crypto revenue and yield on full autopilot.
- *
- * Implements:
- * 1. Mathematical EV Ranking (YieldRanker)
- * 2. Independent Multi-Agent Fleet Assignment (20 Wallet Agents)
- * 3. 10-Step Modular Strategy Pipeline
- * 4. Verifiable On-Chain Settlement Proofs
- * 5. Automatic 20/20/20/30/5/5 Decimal Capital Loop
- * 6. Cryptographically Chained SHA-256 Audit Trail
+ * 
+ * Strict compliance:
+ * - Pre-flight checks: Capital, Wallet, Signer, RPC Health, Venue, Net EV, Risk Policy
+ * - If no live executable opportunity or customer order:
+ *   Status = WAITING_FOR_REAL_OPPORTUNITY or WAITING_FOR_CUSTOMER
+ * - Never create $0 execution spam or invent fake signatures
+ * - Real economic executions only when genuine authoritative evidence exists
+ * - Primary KPI: VERIFIED_REALIZED_NET_PROFIT
  */
 
-import { randomBytes, createHash } from 'crypto';
 import { 
   AutopilotExecutionRecord, 
   AutopilotStatus, 
   Opportunity, 
-  WalletAgent, 
-  StrategyCategory 
+  WalletAgent 
 } from '../../src/types/yabbai';
 import { FleetEngine } from './fleetEngine';
 import { OpportunityRegistry, YieldRanker } from './opportunityRegistry';
-import { StrategyRegistry } from './strategyRegistry';
+import { StrategyRegistry, IStrategyModule } from './strategyRegistry';
 import { RevenueLedger } from './revenueLedger';
+import { ProfitAccountingEngine } from './profitAccounting';
 import { SecurityGuard } from '../security/guard';
 import { TransactionStateMachine } from '../solana/txStateMachine';
-import { CurrentPredicamentEngine } from './opportunityRegistry';
+import { SolanaProviderManager } from '../solana/provider';
+
+export type AutopilotRuntimeState = 
+  | 'WAITING_FOR_REAL_OPPORTUNITY'
+  | 'WAITING_FOR_CUSTOMER'
+  | 'PRE_FLIGHT_CHECKING'
+  | 'EXECUTING'
+  | 'SETTLED'
+  | 'PAUSED'
+  | 'EMERGENCY_STOPPED';
 
 export class AutopilotEngine {
   private fleetEngine: FleetEngine;
   private opportunityRegistry: OpportunityRegistry;
   private strategyRegistry: StrategyRegistry;
   private revenueLedger: RevenueLedger;
+  private profitAccounting: ProfitAccountingEngine;
   private securityGuard: SecurityGuard;
   private txStateMachine: TransactionStateMachine;
+  private solanaProvider?: SolanaProviderManager;
 
   private isActive: boolean = true;
   private isExecuting: boolean = false;
-  private cycleIntervalMs: number = 8000;
+  private runtimeState: AutopilotRuntimeState = 'WAITING_FOR_REAL_OPPORTUNITY';
+  private cycleIntervalMs: number = 10000;
   private intervalTimer: NodeJS.Timeout | null = null;
 
-  private totalCyclesExecuted: number = 0;
-  private totalProfitGeneratedUsd: number = 0;
+  private totalCyclesEvaluated: number = 0;
+  private totalEconomicExecutions: number = 0;
+  private verifiedRealizedNetProfitUsd: number = 0;
   private consecutiveSuccessfulCycles: number = 0;
   private lastExecution?: AutopilotExecutionRecord;
   private recentExecutions: AutopilotExecutionRecord[] = [];
@@ -52,27 +62,32 @@ export class AutopilotEngine {
     opportunityRegistry: OpportunityRegistry;
     strategyRegistry: StrategyRegistry;
     revenueLedger: RevenueLedger;
+    profitAccounting: ProfitAccountingEngine;
     securityGuard: SecurityGuard;
     txStateMachine: TransactionStateMachine;
+    solanaProvider?: SolanaProviderManager;
   }) {
     this.fleetEngine = deps.fleetEngine;
     this.opportunityRegistry = deps.opportunityRegistry;
     this.strategyRegistry = deps.strategyRegistry;
     this.revenueLedger = deps.revenueLedger;
+    this.profitAccounting = deps.profitAccounting;
     this.securityGuard = deps.securityGuard;
     this.txStateMachine = deps.txStateMachine;
+    this.solanaProvider = deps.solanaProvider;
 
-    // Start background autopilot loop
     this.startBackgroundRunner();
   }
 
-  public getStatus(): AutopilotStatus {
+  public getStatus(): AutopilotStatus & { runtimeState: AutopilotRuntimeState; verifiedRealizedNetProfitUsd: number } {
     return {
       isActive: this.isActive,
       isExecuting: this.isExecuting,
+      runtimeState: this.runtimeState,
       cycleIntervalMs: this.cycleIntervalMs,
-      totalCyclesExecuted: this.totalCyclesExecuted,
-      totalProfitGeneratedUsd: Math.round(this.totalProfitGeneratedUsd * 100) / 100,
+      totalCyclesExecuted: this.totalCyclesEvaluated,
+      totalProfitGeneratedUsd: Math.round(this.verifiedRealizedNetProfitUsd * 100) / 100,
+      verifiedRealizedNetProfitUsd: Math.round(this.verifiedRealizedNetProfitUsd * 100) / 100,
       consecutiveSuccessfulCycles: this.consecutiveSuccessfulCycles,
       lastExecution: this.lastExecution,
       recentExecutions: this.recentExecutions.slice(0, 15)
@@ -80,11 +95,13 @@ export class AutopilotEngine {
   }
 
   public reset() {
-    this.totalCyclesExecuted = 0;
-    this.totalProfitGeneratedUsd = 0;
+    this.totalCyclesEvaluated = 0;
+    this.totalEconomicExecutions = 0;
+    this.verifiedRealizedNetProfitUsd = 0;
     this.consecutiveSuccessfulCycles = 0;
     this.lastExecution = undefined;
     this.recentExecutions = [];
+    this.runtimeState = 'WAITING_FOR_REAL_OPPORTUNITY';
   }
 
   public toggle(): boolean {
@@ -93,12 +110,13 @@ export class AutopilotEngine {
       this.startBackgroundRunner();
     } else {
       this.stopBackgroundRunner();
+      this.runtimeState = 'PAUSED';
     }
     return this.isActive;
   }
 
   public setCycleInterval(intervalMs: number) {
-    this.cycleIntervalMs = Math.max(3000, intervalMs);
+    this.cycleIntervalMs = Math.max(5000, intervalMs);
     if (this.isActive) {
       this.stopBackgroundRunner();
       this.startBackgroundRunner();
@@ -112,7 +130,7 @@ export class AutopilotEngine {
     this.intervalTimer = setInterval(() => {
       if (this.isActive && !this.isExecuting) {
         this.executeAutonomousCycle().catch((err) => {
-          console.error('[Autopilot] Background cycle error:', err.message);
+          console.error('[Autopilot] Background evaluation error:', err.message);
         });
       }
     }, this.cycleIntervalMs);
@@ -126,8 +144,8 @@ export class AutopilotEngine {
   }
 
   /**
-   * Main Autonomous Autopilot Execution Cycle
-   * Executes mathematically optimal strategy to make verified profit
+   * Main Autonomous Evaluation & Execution Cycle
+   * Strict pre-flight checks: No fake transactions, no zero-dollar cycle spam
    */
   public async executeAutonomousCycle(): Promise<AutopilotExecutionRecord> {
     if (this.isExecuting) {
@@ -135,284 +153,243 @@ export class AutopilotEngine {
     }
 
     this.isExecuting = true;
+    this.totalCyclesEvaluated++;
 
     try {
-      // 1. Check Circuit Breaker / Emergency Stop
+      // 1. Pre-Flight: Circuit Breaker / Emergency Stop
       const secState = this.securityGuard.getSecurityState();
       if (secState.emergencyStopEngaged) {
-        const skippedRecord = this.recordSkippedCycle('EMERGENCY_STOP_ACTIVE', 'System circuit breaker is engaged');
-        return skippedRecord;
+        this.runtimeState = 'EMERGENCY_STOPPED';
+        throw new Error('Emergency Stop engaged - autopilot evaluation frozen');
       }
 
-      // 2. Query Current Capital & Predicament
-      const buckets = this.revenueLedger.getCapitalBuckets();
-      const allAgents = this.fleetEngine.getAllAgents();
-      const totalGasSol = allAgents.reduce((sum, a) => sum + a.budget.currentGasBalanceSol, 0);
-      const predicament = CurrentPredicamentEngine.evaluate(buckets.totalVerifiedCapitalUsd, totalGasSol);
+      this.runtimeState = 'PRE_FLIGHT_CHECKING';
 
-      // 3. Scan & Filter Opportunities by Mathematical Expected Value
-      const allOpps = this.opportunityRegistry.getAll();
-      const eligibleOpps = allOpps.filter((opp) => {
-        if (opp.status !== 'ACTIVE') return false;
-        
-        // Zero-capital mode restriction check
-        if (predicament.zeroCapitalModeActive && !opp.isZeroCapital) return false;
+      // 2. Pre-Flight: Live Working Capital Check
+      const accounting = this.profitAccounting.getLedger();
+      const availableOperatingUsd = accounting.operatingCapitalUsd;
 
-        // Capital availability check
-        if (opp.capitalRequiredUsd > buckets.strategyCapitalUsd && !opp.isZeroCapital) return false;
+      // 3. Pre-Flight: Opportunity Discovery & Ranking
+      const activeOpps = this.opportunityRegistry.getActiveOpportunities();
+      const rankedOpps = YieldRanker.rankByNetEv(activeOpps);
 
-        // Positive net EV check (EV - fees - slippage - risk - capital > 0)
-        const calculatedNetEv = YieldRanker.calculateNetEv(opp);
-        return calculatedNetEv > 0;
-      });
-
-      if (eligibleOpps.length === 0) {
-        return this.recordSkippedCycle('NO_ELIGIBLE_OPPORTUNITIES', 'No opportunities currently meet risk/capital EV thresholds');
+      if (rankedOpps.length === 0) {
+        this.runtimeState = 'WAITING_FOR_REAL_OPPORTUNITY';
+        const waitingRecord: AutopilotExecutionRecord = {
+          id: `eval-${Date.now()}`,
+          timestamp: Date.now(),
+          cycleNumber: this.totalCyclesEvaluated,
+          opportunityId: 'none',
+          opportunityTitle: 'Surveillance Active: Waiting for Real Executable Opportunity',
+          category: 'analytics',
+          agentId: 'agent-01',
+          agentName: 'Awaiting Opportunity',
+          agentWallet: 'none',
+          grossRevenueUsd: 0,
+          costUsd: 0,
+          netProfitUsd: 0,
+          evidenceSignature: 'none',
+          solscanUrl: '',
+          allocationId: 'none',
+          lifecycleStages: ['DISCOVER'],
+          capitalAllocated: {
+            treasuryUsd: 0,
+            operatingUsd: 0,
+            growthUsd: 0,
+            strategyUsd: 0,
+            gasFeesUsd: 0,
+            userFundsUsd: 0
+          },
+          status: 'SKIPPED',
+          reason: 'No opportunities met net-positive mathematical EV thresholds.'
+        };
+        this.lastExecution = waitingRecord;
+        return waitingRecord;
       }
 
-      // 4. Rank by Highest Net EV
-      eligibleOpps.sort((a, b) => b.netEvUsd - a.netEvUsd);
+      const selectedOpp = rankedOpps[0];
 
-      // 5. Find the best matching Agent for the highest Net EV opportunity
-      let selectedOpp: Opportunity | null = null;
-      let selectedAgent: WalletAgent | null = null;
+      // 4. Pre-Flight: Check live execution venue
+      const strategyModule = this.strategyRegistry.get(selectedOpp.strategyId || 'strat-sec-audit');
+      if (!strategyModule || strategyModule.executionMode !== 'LIVE_EXECUTABLE') {
+        // Research-only strategy: Produce simulation report without generating fake revenue
+        this.runtimeState = 'WAITING_FOR_REAL_OPPORTUNITY';
+        const quote = await strategyModule?.quote({}) || {
+          strategyId: selectedOpp.id,
+          category: selectedOpp.category,
+          executionMode: 'RESEARCH_ONLY',
+          capitalRequiredUsd: 0,
+          gasRequiredSol: 0,
+          expectedGrossRevenueUsd: selectedOpp.rawExpectedValueUsd,
+          slippageEstimatedUsd: 0,
+          networkFeeEstimatedUsd: 0,
+          riskCostUsd: 0,
+          netExpectedRevenueUsd: selectedOpp.netEvUsd,
+          validForSeconds: 300
+        };
 
-      for (const opp of eligibleOpps) {
-        // Find agents permitted for this category and not emergency stopped
-        const candidateAgents = allAgents.filter((agent) => {
-          return agent.status !== 'EMERGENCY_STOPPED' && 
-                 agent.status !== 'PAUSED' &&
-                 agent.strategyPermissions.includes(opp.category);
-        });
+        const simResult = await strategyModule?.simulate(quote);
+        const researchRecord: AutopilotExecutionRecord = {
+          id: `research-${Date.now()}`,
+          timestamp: Date.now(),
+          cycleNumber: this.totalCyclesEvaluated,
+          opportunityId: selectedOpp.id,
+          opportunityTitle: `[RESEARCH SIMULATION] ${selectedOpp.title}`,
+          category: selectedOpp.category,
+          agentId: 'agent-01',
+          agentName: 'Research Observer',
+          agentWallet: 'none',
+          grossRevenueUsd: 0,
+          costUsd: 0,
+          netProfitUsd: 0,
+          evidenceSignature: 'none',
+          solscanUrl: '',
+          allocationId: 'none',
+          lifecycleStages: ['DISCOVER', 'VALIDATE', 'QUOTE', 'SIMULATE'],
+          capitalAllocated: {
+            treasuryUsd: 0,
+            operatingUsd: 0,
+            growthUsd: 0,
+            strategyUsd: 0,
+            gasFeesUsd: 0,
+            userFundsUsd: 0
+          },
+          status: 'SKIPPED',
+          reason: `Strategy ${selectedOpp.title} is in RESEARCH_ONLY mode. Simulation logged without recording revenue.`
+        };
 
-        for (const candidate of candidateAgents) {
-          const decision = this.fleetEngine.evaluateOpportunityIndependently(candidate.id, opp);
-          if (decision.decision === 'ACCEPT') {
-            selectedOpp = opp;
-            selectedAgent = candidate;
-            break;
-          }
-        }
-
-        if (selectedOpp && selectedAgent) {
-          break;
-        }
+        this.lastExecution = researchRecord;
+        return researchRecord;
       }
 
-      // Fallback: If all candidates deferred on gas or capital, pick zero-capital security or analytics
-      if (!selectedOpp || !selectedAgent) {
-        const zeroOpp = allOpps.find(o => o.isZeroCapital && o.category === 'security_analysis') || allOpps[0];
-        selectedOpp = zeroOpp;
-        selectedAgent = allAgents[0]; // Sentinel-Zero-Sec
+      // 5. Pre-Flight: Agent Assignment & Policy Verification
+      const availableAgents = this.fleetEngine.getAvailableAgents(selectedOpp.category);
+      if (availableAgents.length === 0) {
+        this.runtimeState = 'WAITING_FOR_REAL_OPPORTUNITY';
+        const record: AutopilotExecutionRecord = {
+          id: `eval-${Date.now()}`,
+          timestamp: Date.now(),
+          cycleNumber: this.totalCyclesEvaluated,
+          opportunityId: selectedOpp.id,
+          opportunityTitle: selectedOpp.title,
+          category: selectedOpp.category,
+          agentId: 'fleet',
+          agentName: 'Fleet Engine',
+          agentWallet: 'none',
+          grossRevenueUsd: 0,
+          costUsd: 0,
+          netProfitUsd: 0,
+          evidenceSignature: 'none',
+          solscanUrl: '',
+          allocationId: 'none',
+          lifecycleStages: ['DISCOVER', 'VALIDATE'],
+          capitalAllocated: {
+            treasuryUsd: 0,
+            operatingUsd: 0,
+            growthUsd: 0,
+            strategyUsd: 0,
+            gasFeesUsd: 0,
+            userFundsUsd: 0
+          },
+          status: 'SKIPPED',
+          reason: 'All qualified agents are currently executing or stopped by risk policy.'
+        };
+        this.lastExecution = record;
+        return record;
       }
 
-      // 6. Execute 10-Step Modular Strategy Lifecycle
-      this.fleetEngine.setAgentStatus(selectedAgent.id, 'EXECUTING');
+      // Live Executable Digital Opportunity Available: Awaiting incoming customer settlement
+      this.runtimeState = 'WAITING_FOR_CUSTOMER';
 
-      const stratModule = this.strategyRegistry.getStrategy(
-        selectedOpp.category === 'security_analysis' ? 'strat-sec-audit' : 
-        selectedOpp.category === 'arbitrage' ? 'strat-flash-arb' : 
-        'strat-sec-audit'
-      ) || this.strategyRegistry.getAllStrategies()[0];
-
-      // Step 1: Discover
-      await stratModule.discover();
-      // Step 2: Validate
-      await stratModule.validate({ availableCapitalUsd: buckets.strategyCapitalUsd });
-      // Step 3: Quote
-      const quote = await stratModule.quote({ availableCapitalUsd: buckets.strategyCapitalUsd });
-      // Step 4: Simulate
-      await stratModule.simulate(quote);
-      // Step 5: Risk Check
-      await stratModule.risk_check(quote);
-      // Step 6: Authorize
-      const auth = await stratModule.authorize(quote, `Autopilot-Agent-${selectedAgent.slotNumber}`);
-      // Step 7: Execute
-      const execResult = await stratModule.execute(auth.authId, quote);
-      // Step 8: Verify
-      await stratModule.verify(execResult);
-      // Step 9: Account
-      await stratModule.account(execResult);
-      // Step 10: Score
-      await stratModule.score(execResult);
-
-      // 7. Authoritative Ingest Guard:
-      // When operating in Zero-Capital or scouting mode, cycles perform market surveillance & yield calculation
-      // without injecting synthetic balances into the withdrawable treasury ledger.
-      const hasRealCapital = buckets.strategyCapitalUsd > 0;
-      let netProfit = 0;
-      let allocationId = 'zero-capital-mode';
-      let proofSig = `scout-${Date.now()}`;
-
-      if (hasRealCapital) {
-        const realizedGross = Math.max(selectedOpp.netEvUsd, execResult.realizedGrossRevenueUsd || 0);
-        const networkCost = selectedOpp.networkFeesUsd + selectedOpp.tradingFeesUsd + (selectedOpp.gasRequiredSol * 180);
-        netProfit = Math.max(0, Math.round((realizedGross - networkCost) * 100) / 100);
-
-        if (netProfit > 0) {
-          const randomSigChars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-          let simulatedSig = '5';
-          for (let i = 0; i < 86; i++) {
-            simulatedSig += randomSigChars.charAt(Math.floor(Math.random() * randomSigChars.length));
-          }
-          proofSig = simulatedSig;
-
-          const revenueEntry = this.revenueLedger.verifyOnChainRevenue({
-            signature: simulatedSig,
-            recipientAddress: selectedAgent.walletAddress,
-            senderAddress: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',
-            assetMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-            amountUnits: (Math.round(netProfit * 1e6)).toString(),
-            amountUsd: netProfit,
-            network: 'solana-mainnet',
-            slotConfirmed: 289500000 + this.totalCyclesExecuted * 12
-          });
-          allocationId = revenueEntry.allocationId;
-        }
-      }
-
-      // 9. Update Agent Performance History
-      selectedAgent.performanceHistory.totalTasksExecuted++;
-      selectedAgent.performanceHistory.successfulExecutions++;
-      if (netProfit > 0) {
-        selectedAgent.performanceHistory.verifiedRevenueUsd = Math.round((selectedAgent.performanceHistory.verifiedRevenueUsd + netProfit) * 100) / 100;
-        selectedAgent.performanceHistory.realizedPnlUsd = Math.round((selectedAgent.performanceHistory.realizedPnlUsd + netProfit) * 100) / 100;
-      }
-      selectedAgent.performanceHistory.winRate = 100.0;
-      selectedAgent.status = 'IDLE';
-      selectedAgent.heartbeat = Date.now();
-
-      // 10. Record Transaction in State Machine Lifecycle
-      const txId = `tx-autopilot-${Date.now()}`;
-      await this.txStateMachine.processIntent({
-        id: txId,
-        agentId: selectedAgent.id,
-        targetRecipient: selectedAgent.walletAddress,
-        amountLamports: Math.round(netProfit * 1e9),
-        strategyCategory: selectedOpp.category,
-        maxSlippageBps: 50,
-        priorityFeeMicroLamports: 1000,
-        instructionType: 'TRANSFER',
-        policyConstraints: {
-          maxLossUsd: selectedAgent.dailyLossLimitUsd,
-          requireMultisig: false,
-          zeroCapitalMode: selectedOpp.isZeroCapital
-        }
-      });
-
-      // 11. Record Cryptographic Audit Log
-      this.securityGuard.recordAudit({
-        actor: selectedAgent.id,
-        action: hasRealCapital ? 'AUTOPILOT_EXECUTION_COMPLETED' : 'AUTOPILOT_SCOUTING_COMPLETED',
-        resourceId: selectedOpp.id,
-        details: {
-          strategy: selectedOpp.title,
-          grossRevenueUsd: netProfit,
-          netProfitUsd: netProfit,
-          signature: proofSig,
-          allocationId
-        }
-      });
-
-      // 12. Emit Signal on Bus
-      this.fleetEngine.signalBus.emitSignal({
-        id: `sig-${Date.now()}`,
-        sourceAgentId: selectedAgent.id,
-        strategyId: selectedOpp.id,
-        category: selectedOpp.category,
+      const idleRecord: AutopilotExecutionRecord = {
+        id: `standby-${Date.now()}`,
         timestamp: Date.now(),
-        signalConfidence: 0.96,
-        expectedValueUsd: selectedOpp.netEvUsd,
-        gasCostEstimateSol: selectedOpp.gasRequiredSol,
-        evidenceSignature: proofSig,
-        metadata: { opportunityTitle: selectedOpp.title, netProfitUsd: netProfit },
-        evaluations: {}
-      });
-
-      // 13. Construct Autopilot Record
-      const record: AutopilotExecutionRecord = {
-        id: `auto-cycle-${Date.now()}-${this.totalCyclesExecuted + 1}`,
-        timestamp: Date.now(),
-        cycleNumber: this.totalCyclesExecuted + 1,
+        cycleNumber: this.totalCyclesEvaluated,
         opportunityId: selectedOpp.id,
         opportunityTitle: selectedOpp.title,
         category: selectedOpp.category,
-        agentId: selectedAgent.id,
-        agentName: selectedAgent.name,
-        agentWallet: selectedAgent.walletAddress,
-        grossRevenueUsd: netProfit,
+        agentId: availableAgents[0].id,
+        agentName: availableAgents[0].name,
+        agentWallet: availableAgents[0].walletAddress,
+        grossRevenueUsd: 0,
         costUsd: 0,
-        netProfitUsd: netProfit,
-        evidenceSignature: proofSig,
-        solscanUrl: `https://solscan.io/account/${selectedAgent.walletAddress}`,
-        allocationId,
-        lifecycleStages: [
-          'discover', 'validate', 'quote', 'simulate', 
-          'risk_check', 'authorize', 'execute', 'verify', 
-          'account_20_20_20_30_5_5', 'score'
-        ],
+        netProfitUsd: 0,
+        evidenceSignature: 'none',
+        solscanUrl: '',
+        allocationId: 'none',
+        lifecycleStages: ['DISCOVER', 'VALIDATE', 'QUOTE'],
         capitalAllocated: {
-          treasuryUsd: Math.round(netProfit * 0.20 * 100) / 100,
-          operatingUsd: Math.round(netProfit * 0.20 * 100) / 100,
-          growthUsd: Math.round(netProfit * 0.20 * 100) / 100,
-          strategyUsd: Math.round(netProfit * 0.30 * 100) / 100,
-          gasFeesUsd: Math.round(netProfit * 0.05 * 100) / 100,
-          userFundsUsd: Math.round(netProfit * 0.05 * 100) / 100
+          treasuryUsd: 0,
+          operatingUsd: 0,
+          growthUsd: 0,
+          strategyUsd: 0,
+          gasFeesUsd: 0,
+          userFundsUsd: 0
         },
-        status: 'COMPLETED'
+        status: 'SKIPPED',
+        reason: 'Autonomous pipeline ready. Standing by for customer order or authorized DEX settlement.'
       };
 
-      this.totalCyclesExecuted++;
-      this.totalProfitGeneratedUsd = Math.round((this.totalProfitGeneratedUsd + netProfit) * 100) / 100;
-      this.consecutiveSuccessfulCycles++;
-      this.lastExecution = record;
-      this.recentExecutions.unshift(record);
-      if (this.recentExecutions.length > 30) {
-        this.recentExecutions.pop();
-      }
-
-      return record;
-
-    } catch (error: any) {
-      this.consecutiveSuccessfulCycles = 0;
-      const failedRecord = this.recordSkippedCycle('EXECUTION_ERROR', error.message);
-      return failedRecord;
+      this.lastExecution = idleRecord;
+      return idleRecord;
     } finally {
       this.isExecuting = false;
     }
   }
 
-  private recordSkippedCycle(reasonCode: string, description: string): AutopilotExecutionRecord {
+  /**
+   * Called when a genuine, verified customer payment or on-chain settlement occurs
+   */
+  public recordVerifiedSettlement(params: {
+    opportunityTitle: string;
+    category: any;
+    agentId: string;
+    agentName: string;
+    agentWallet: string;
+    grossUsd: number;
+    costUsd: number;
+    netProfitUsd: number;
+    signature: string;
+    solscanUrl: string;
+  }): AutopilotExecutionRecord {
+    this.totalEconomicExecutions++;
+    this.verifiedRealizedNetProfitUsd = Math.round((this.verifiedRealizedNetProfitUsd + params.netProfitUsd) * 100) / 100;
+    this.consecutiveSuccessfulCycles++;
+    this.runtimeState = 'SETTLED';
+
     const record: AutopilotExecutionRecord = {
-      id: `auto-cycle-${Date.now()}-${this.totalCyclesExecuted + 1}`,
+      id: `exec-${Date.now()}`,
       timestamp: Date.now(),
-      cycleNumber: this.totalCyclesExecuted + 1,
-      opportunityId: 'NONE',
-      opportunityTitle: 'Skipped Evaluation',
-      category: 'security_analysis',
-      agentId: 'SYSTEM',
-      agentName: 'Autopilot Guard',
-      agentWallet: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU',
-      grossRevenueUsd: 0,
-      costUsd: 0,
-      netProfitUsd: 0,
-      evidenceSignature: '',
-      solscanUrl: '',
-      allocationId: '',
-      lifecycleStages: [],
+      cycleNumber: this.totalEconomicExecutions,
+      opportunityId: `opp-settled-${Date.now()}`,
+      opportunityTitle: params.opportunityTitle,
+      category: params.category,
+      agentId: params.agentId,
+      agentName: params.agentName,
+      agentWallet: params.agentWallet,
+      grossRevenueUsd: params.grossUsd,
+      costUsd: params.costUsd,
+      netProfitUsd: params.netProfitUsd,
+      evidenceSignature: params.signature,
+      solscanUrl: params.solscanUrl,
+      allocationId: `alloc-${Date.now()}`,
+      lifecycleStages: [
+        'DISCOVER', 'VALIDATE', 'QUOTE', 'SIMULATE', 'RISK_CHECK',
+        'AUTHORIZE', 'EXECUTE', 'VERIFY', 'ACCOUNT', 'SCORE'
+      ],
       capitalAllocated: {
-        treasuryUsd: 0,
-        operatingUsd: 0,
-        growthUsd: 0,
-        strategyUsd: 0,
-        gasFeesUsd: 0,
-        userFundsUsd: 0
+        treasuryUsd: Math.round(params.netProfitUsd * 0.20 * 100) / 100,
+        operatingUsd: Math.round(params.netProfitUsd * 0.20 * 100) / 100,
+        growthUsd: Math.round(params.netProfitUsd * 0.20 * 100) / 100,
+        strategyUsd: Math.round(params.netProfitUsd * 0.30 * 100) / 100,
+        gasFeesUsd: Math.round(params.netProfitUsd * 0.05 * 100) / 100,
+        userFundsUsd: Math.round(params.netProfitUsd * 0.05 * 100) / 100
       },
-      status: reasonCode === 'EXECUTION_ERROR' ? 'FAILED' : 'SKIPPED',
-      reason: `${reasonCode}: ${description}`
+      status: 'COMPLETED'
     };
 
     this.lastExecution = record;
+    this.recentExecutions.unshift(record);
     return record;
   }
 }

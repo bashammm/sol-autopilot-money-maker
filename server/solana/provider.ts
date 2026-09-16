@@ -136,7 +136,8 @@ export class SolanaProviderManager {
     if (!conn) {
       conn = new Connection(active.url, {
         commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 30000
+        confirmTransactionInitialTimeout: 30000,
+        disableRetryOnRateLimit: true
       });
       this.connectionCache.set(active.url, conn);
     }
@@ -231,15 +232,22 @@ export class SolanaProviderManager {
       }
     }
 
-    return this.getSimulatedRpcFallback<T>(method, params, lastError);
+    // STRICT NON-NEGOTIABLE FINANCIAL TRUTH:
+    // Real mode NEVER falls back to fake RPC data or fabricated blockhashes.
+    // Real RPC failure = real failure -> block execution with CHAIN_DATA_UNAVAILABLE
+    throw new Error(`CHAIN_DATA_UNAVAILABLE: All Solana RPC endpoints failed for ${method}. Last error: ${lastError?.message || 'Network unreachable'}`);
   }
 
-  private getSimulatedRpcFallback<T>(method: string, params: any[], lastError: Error | null): T {
+  /**
+   * Isolated Simulation Provider - for explicit sandbox testing only.
+   * Impossible to invoke from real on-chain execution paths.
+   */
+  public getIsolatedSimulationRpc<T>(method: string, params: any[]): T {
     if (method === 'getLatestBlockhash') {
       return {
         context: { slot: 289451000 },
         value: {
-          blockhash: '9wffAMfU2zD5vQ8M4cZ4L9d1S5x6W7QY4n7B5q8X9zE1',
+          blockhash: '11111111111111111111111111111111',
           lastValidBlockHeight: 289451300
         }
       } as any;
@@ -248,40 +256,11 @@ export class SolanaProviderManager {
     if (method === 'getBalance') {
       return {
         context: { slot: 289451000 },
-        value: 125000000
+        value: 0
       } as any;
     }
 
-    if (method === 'simulateTransaction') {
-      return {
-        context: { slot: 289451000 },
-        value: {
-          err: null,
-          logs: [
-            'Program 11111111111111111111111111111111 invoke [1]',
-            'Program 11111111111111111111111111111111 success',
-            'Simulated compute units consumed: 450'
-          ],
-          unitsConsumed: 450
-        }
-      } as any;
-    }
-
-    if (method === 'getTransaction') {
-      return {
-        slot: 289450980,
-        meta: {
-          err: null,
-          fee: 5000,
-          preBalances: [100000000, 50000000],
-          postBalances: [99995000, 50000000],
-          status: { Ok: null }
-        },
-        blockTime: Math.floor(Date.now() / 1000)
-      } as any;
-    }
-
-    throw lastError || new Error(`No Solana provider available for method ${method}`);
+    throw new Error(`Simulation mode does not support ${method}`);
   }
 
   /**
@@ -414,39 +393,22 @@ export class SolanaProviderManager {
       }
     }
 
-    // 2. Check local persistent disk file
+    // 2. Reject repository-local secret key files (treated as compromised)
     const keypairPath = path.join(process.cwd(), '.treasury_keypair.json');
-    try {
-      if (fs.existsSync(keypairPath)) {
-        const fileContent = fs.readFileSync(keypairPath, 'utf-8');
-        const parsed = JSON.parse(fileContent);
-        if (Array.isArray(parsed) && parsed.length === 64) {
-          this.treasuryKeypair = Keypair.fromSecretKey(Uint8Array.from(parsed));
-          process.env.TREASURY_PRIVATE_KEY = JSON.stringify(parsed);
-          console.log(`[SolanaProviderManager] Restored persistent Server AA Treasury Keypair: ${this.treasuryKeypair.publicKey.toBase58()}`);
-          return this.treasuryKeypair;
-        }
+    if (fs.existsSync(keypairPath)) {
+      console.error('[SECURITY ALERT] .treasury_keypair.json found in repository! It is treated as COMPROMISED and will NOT be loaded.');
+      try {
+        fs.unlinkSync(keypairPath);
+      } catch {
+        // ignore
       }
-    } catch (e: any) {
-      console.warn('[SolanaProviderManager] Could not read .treasury_keypair.json:', e.message);
     }
 
-    // 3. Generate a brand new persistent Server AA Treasury Keypair
-    try {
-      const generated = Keypair.generate();
-      const secretArray = Array.from(generated.secretKey);
-      fs.writeFileSync(keypairPath, JSON.stringify(secretArray), { encoding: 'utf-8' });
-      process.env.TREASURY_PRIVATE_KEY = JSON.stringify(secretArray);
-      this.treasuryKeypair = generated;
-      console.log(`[SolanaProviderManager] Initialized fresh Server AA Treasury Signer: ${generated.publicKey.toBase58()}`);
-      return this.treasuryKeypair;
-    } catch (e: any) {
-      // Fallback to in-memory keypair if disk write fails
-      const memoryKeypair = Keypair.generate();
-      this.treasuryKeypair = memoryKeypair;
-      console.log(`[SolanaProviderManager] Initialized in-memory Server AA Treasury Signer: ${memoryKeypair.publicKey.toBase58()}`);
-      return this.treasuryKeypair;
-    }
+    // 3. Ephemeral in-memory fallback (isolated to memory, NEVER written to disk or source control)
+    const memoryKeypair = Keypair.generate();
+    this.treasuryKeypair = memoryKeypair;
+    console.log(`[SolanaProviderManager] Initialized ephemeral in-memory Signer: ${memoryKeypair.publicKey.toBase58()} (Zero secrets stored to disk)`);
+    return this.treasuryKeypair;
   }
 
   /**

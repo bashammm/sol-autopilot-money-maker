@@ -148,6 +148,7 @@ export interface Opportunity {
   id: string;
   title: string;
   category: StrategyCategory;
+  strategyId?: string;
   tierRequirement: ExecutionTier;
   capitalRequiredUsd: number;
   gasRequiredSol: number;
@@ -206,6 +207,24 @@ export interface RevenueLedgerEntry {
   allocatedCapitalUsd: number;
   realizedPnlUsd: number;
   verificationEvidenceUrl?: string;
+}
+
+export interface FormalAccountingLedger {
+  initialCapitalUsd: number;
+  operatingCapitalUsd: number;
+  reserveUsd: number;
+  customerFundsUsd: number;
+  realizedRevenueUsd: number;
+  verifiedCostsUsd: number;
+  realizedProfitUsd: number;
+  unrealizedPnlUsd: number;
+  unattributedInflowUsd: number;
+  withdrawnProfitUsd: number;
+  withdrawnCapitalUsd: number;
+  pendingSweepUsd: number;
+  withdrawableProfitUsd: number;
+  totalBalanceUsd: number;
+  lastReconciliationTimestamp: number;
 }
 
 export interface CapitalBuckets {
@@ -450,6 +469,9 @@ export interface ProfitSweepStatus {
   totalSweptSol: number;
   sweepsCount: number;
   isAutoSweepActive: boolean;
+  isSweepBlocked?: boolean;
+  blockedReason?: string;
+  sweepableProfitUsd?: number;
   recentSweeps: TreasuryWithdrawalRecord[];
   executionMode?: 'REAL_ON_CHAIN' | 'SIMULATION_LEDGER';
   hasTreasuryKeypair?: boolean;
@@ -589,6 +611,7 @@ export interface CustomerOrder {
   customer_wallet?: string;
   product_id: string;
   product_name: string;
+  product_sku?: string;
   asset: string;
   mint: string;
   amountDue: number;

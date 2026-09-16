@@ -282,4 +282,13 @@ export class FleetEngine {
       }
     }
   }
+
+  public getAvailableAgents(category?: StrategyCategory): WalletAgent[] {
+    const all = Array.from(this.agents.values());
+    return all.filter(a => {
+      const isAvailable = a.status === 'ACTIVE' || a.status === 'IDLE';
+      const hasPerm = !category || a.strategyPermissions.includes(category);
+      return isAvailable && hasPerm;
+    });
+  }
 }

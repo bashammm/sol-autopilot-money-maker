@@ -27,6 +27,9 @@ import { CentralizedTreasuryManager } from './server/solana/treasuryConfig';
 import { CryptoExecutionEngine } from './server/solana/cryptoExecutionEngine';
 import { InboundPaymentEngine } from './server/engines/paymentEngine';
 import { TreasuryReconciliationService } from './server/engines/treasuryReconciliation';
+import { AdminAuthManager } from './server/security/authMiddleware';
+import { WalletFleetManager } from './server/solana/walletFleet';
+import { ProfitAccountingEngine } from './server/engines/profitAccounting';
 
 // Test runner import
 import { runAllVerificationTests } from './test/test-suite';
@@ -38,17 +41,28 @@ async function startServer() {
   // Security & Parsing Middlewares
   app.use(express.json({ limit: '1mb' }));
 
-  // Initialize Core Engines
+  // Initialize Core Engines & Security Guards
   const providerManager = new SolanaProviderManager();
   const treasuryManager = new CentralizedTreasuryManager();
   const securityGuard = new SecurityGuard();
+  const storageEngine = new StorageEngine();
   const revenueLedger = new RevenueLedger();
+  const profitAccounting = new ProfitAccountingEngine(securityGuard);
+
+  // Initialize Admin Authentication Guard
+  AdminAuthManager.initialize(securityGuard);
+  const requireAdmin = AdminAuthManager.requireAdmin(securityGuard);
+
+  const walletFleetManager = new WalletFleetManager(providerManager, securityGuard);
+
   const paymentEngine = new InboundPaymentEngine(
     providerManager,
     treasuryManager,
     revenueLedger,
     marketPriceService,
-    securityGuard
+    securityGuard,
+    profitAccounting,
+    storageEngine
   );
   const cryptoExecutionEngine = new CryptoExecutionEngine(
     providerManager,
@@ -71,19 +85,22 @@ async function startServer() {
   const strategyRegistry = new StrategyRegistry();
   const treasurySquads = new TreasurySquadsEngine();
   const taskQueue = new EarningTaskQueue();
-  const storageEngine = new StorageEngine();
   const autopilotEngine = new AutopilotEngine({
     fleetEngine,
     opportunityRegistry,
     strategyRegistry,
     revenueLedger,
+    profitAccounting,
     securityGuard,
-    txStateMachine
+    txStateMachine,
+    solanaProvider: providerManager
   });
   const profitSweepEngine = new ProfitSweepEngine({
     revenueLedger,
+    profitAccounting,
     solanaProvider: providerManager,
-    txStateMachine
+    txStateMachine,
+    securityGuard
   });
 
   // Basic CORS & Security Headers
@@ -738,7 +755,95 @@ async function startServer() {
     }
   });
 
-  app.post('/api/treasury/execute', (req: Request, res: Response) => {
+  // ==========================================
+  // PRIVILEGED ADMIN AUTHENTICATION GATE
+  // ==========================================
+  app.post('/api/admin/login', (req: Request, res: Response) => {
+    try {
+      const { password } = req.body;
+      const result = AdminAuthManager.createSession(password || '');
+      if (!result.success) {
+        return res.status(401).json({ error: result.error || 'Authentication failed' });
+      }
+      res.json({ success: true, token: result.token });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/admin/session', (req: Request, res: Response) => {
+    const token = AdminAuthManager.extractTokenFromRequest(req);
+    const authenticated = !!(token && AdminAuthManager.verifyToken(token));
+    res.json({
+      authenticated,
+      bootstrapActive: !process.env.ADMIN_API_KEY && !process.env.SYSTEM_AUTH_KEY,
+      bootstrapToken: (!process.env.ADMIN_API_KEY && !process.env.SYSTEM_AUTH_KEY) ? AdminAuthManager.getBootstrapToken() : undefined
+    });
+  });
+
+  // ==========================================
+  // FORMAL PROFIT & CAPITAL ACCOUNTING LEDGER
+  // ==========================================
+  app.get('/api/accounting/ledger', (req: Request, res: Response) => {
+    res.json(profitAccounting.getLedger());
+  });
+
+  app.post('/api/accounting/deposit-capital', requireAdmin, (req: Request, res: Response) => {
+    try {
+      const { amountUsd, source, actor } = req.body;
+      if (!amountUsd || Number(amountUsd) <= 0) {
+        return res.status(400).json({ error: 'Valid deposit amount in USD is required' });
+      }
+      const record = profitAccounting.depositCapital({
+        amountUsd: Number(amountUsd),
+        source: source || 'MANUAL_DEPOSIT',
+        actor: actor || 'ADMIN'
+      });
+      res.json({ success: true, record, ledger: profitAccounting.getLedger() });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 20-WALLET FLEET MANAGEMENT
+  // ==========================================
+  app.get('/api/fleet/wallets', (req: Request, res: Response) => {
+    res.json({
+      wallets: walletFleetManager.getAllWallets(),
+      summary: walletFleetManager.getFleetSummary()
+    });
+  });
+
+  app.get('/api/fleet/wallets/:id', (req: Request, res: Response) => {
+    const w = walletFleetManager.getWallet(req.params.id);
+    if (!w) return res.status(404).json({ error: 'Wallet not found' });
+    res.json(w);
+  });
+
+  app.post('/api/fleet/wallets/verify-onchain', async (req: Request, res: Response) => {
+    try {
+      const verified = await walletFleetManager.verifyAllOnChain();
+      res.json({
+        success: true,
+        wallets: verified,
+        summary: walletFleetManager.getFleetSummary()
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/fleet/wallets/:id/policy', requireAdmin, (req: Request, res: Response) => {
+    try {
+      const updated = walletFleetManager.updateWalletPolicy(req.params.id, req.body);
+      res.json({ success: true, wallet: updated });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/treasury/execute', requireAdmin, (req: Request, res: Response) => {
     try {
       const { proposalId } = req.body;
       const proposal = treasurySquads.executeProposal(proposalId);
@@ -748,7 +853,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/treasury/proposals/:id/execute', (req: Request, res: Response) => {
+  app.post('/api/treasury/proposals/:id/execute', requireAdmin, (req: Request, res: Response) => {
     try {
       const proposal = treasurySquads.executeProposal(req.params.id);
       res.json(proposal);
@@ -757,8 +862,106 @@ async function startServer() {
     }
   });
 
-  // Treasury Direct & Phantom Wallet Withdrawals
-  app.post('/api/treasury/withdraw', async (req: Request, res: Response) => {
+  // Dedicated Realized Profit Withdrawal (Strictly limited to WITHDRAWABLE_PROFIT)
+  app.post('/api/treasury/withdraw-profit', requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const secState = securityGuard.getSecurityState();
+      if (secState.emergencyStopEngaged) {
+        return res.status(403).json({ error: 'EMERGENCY STOP engaged. All profit disbursements are suspended.' });
+      }
+
+      const { recipientAddress, amountUsd, note } = req.body;
+      if (!recipientAddress) {
+        return res.status(400).json({ error: 'Solana wallet recipient address is required' });
+      }
+      const numAmount = Number(amountUsd);
+      if (!numAmount || numAmount <= 0) {
+        return res.status(400).json({ error: 'Valid profit withdrawal amount in USD is required' });
+      }
+
+      const currentLedger = profitAccounting.getLedger();
+      if (numAmount > currentLedger.withdrawableProfitUsd) {
+        return res.status(400).json({
+          error: 'INSUFFICIENT_WITHDRAWABLE_PROFIT',
+          message: `Requested $${numAmount.toFixed(2)} exceeds verified withdrawable profit of $${currentLedger.withdrawableProfitUsd.toFixed(2)}. Withdrawals cannot touch capital or reserves.`,
+          withdrawableProfitUsd: currentLedger.withdrawableProfitUsd,
+          realizedProfitUsd: currentLedger.realizedProfitUsd,
+          initialCapitalUsd: currentLedger.initialCapitalUsd
+        });
+      }
+
+      const record = profitAccounting.withdrawRealizedProfit(numAmount, String(recipientAddress), note);
+      
+      // Optionally attempt live SOL broadcast if signer has balance
+      let onChainSignature: string | undefined;
+      try {
+        const priceData = await marketPriceService.getSolPrice();
+        const estSol = Math.round((numAmount / priceData.solPriceUsd) * 1e6) / 1e6;
+        const signerStatus = await providerManager.getTreasurySignerStatus();
+        if (signerStatus.balanceSol >= estSol) {
+          const liveTx = await providerManager.sendRealSolTransfer(String(recipientAddress), estSol);
+          if (liveTx.success) {
+            onChainSignature = liveTx.signature;
+          }
+        }
+      } catch {
+        // preserve recorded profit withdrawal
+      }
+
+      res.json({
+        success: true,
+        operation: 'WITHDRAW_REALIZED_PROFIT',
+        record,
+        onChainSignature,
+        ledger: profitAccounting.getLedger()
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // Dedicated Capital Withdrawal (Decreases INITIAL/OPERATING CAPITAL, leaves profit untouched)
+  app.post('/api/treasury/withdraw-capital', requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const secState = securityGuard.getSecurityState();
+      if (secState.emergencyStopEngaged) {
+        return res.status(403).json({ error: 'EMERGENCY STOP engaged. All disbursements are suspended.' });
+      }
+
+      const { recipientAddress, amountUsd, bucket, note } = req.body;
+      if (!recipientAddress) {
+        return res.status(400).json({ error: 'Solana wallet recipient address is required' });
+      }
+      const numAmount = Number(amountUsd);
+      if (!numAmount || numAmount <= 0) {
+        return res.status(400).json({ error: 'Valid capital withdrawal amount in USD is required' });
+      }
+
+      const currentLedger = profitAccounting.getLedger();
+      const availableCapital = currentLedger.initialCapitalUsd + currentLedger.operatingCapitalUsd;
+      if (numAmount > availableCapital) {
+        return res.status(400).json({
+          error: 'INSUFFICIENT_CAPITAL',
+          message: `Requested $${numAmount.toFixed(2)} exceeds available capital ($${availableCapital.toFixed(2)}).`,
+          availableCapitalUsd: availableCapital
+        });
+      }
+
+      const record = profitAccounting.withdrawCapital(numAmount, String(recipientAddress), note);
+
+      res.json({
+        success: true,
+        operation: 'WITHDRAW_CAPITAL',
+        record,
+        ledger: profitAccounting.getLedger()
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // Treasury Direct & Phantom Wallet Withdrawals (Admin Protected)
+  app.post('/api/treasury/withdraw', requireAdmin, async (req: Request, res: Response) => {
     try {
       const secState = securityGuard.getSecurityState();
       if (secState.emergencyStopEngaged) {
@@ -954,7 +1157,7 @@ async function startServer() {
     res.json(profitSweepEngine.getStatus());
   });
 
-  app.post('/api/profit-sweep/trigger', async (req: Request, res: Response) => {
+  app.post('/api/profit-sweep/trigger', requireAdmin, async (req: Request, res: Response) => {
     try {
       const forcedAmount = req.body.amountUsd ? Number(req.body.amountUsd) : undefined;
       const record = await profitSweepEngine.executeProfitSweep(forcedAmount);
@@ -969,7 +1172,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/profit-sweep/config', (req: Request, res: Response) => {
+  app.post('/api/profit-sweep/config', requireAdmin, (req: Request, res: Response) => {
     try {
       const updated = profitSweepEngine.updateConfig(req.body);
       res.json({
@@ -990,7 +1193,7 @@ async function startServer() {
     res.json(treasuryManager.getConfig());
   });
 
-  app.post('/api/treasury/config', (req: Request, res: Response) => {
+  app.post('/api/treasury/config', requireAdmin, (req: Request, res: Response) => {
     try {
       const updated = treasuryManager.updateConfig(req.body);
       securityGuard.recordAudit({
@@ -1185,7 +1388,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/security/emergency-stop', (req: Request, res: Response) => {
+  app.post('/api/security/emergency-stop', requireAdmin, (req: Request, res: Response) => {
     const { action, reason, actor } = req.body;
     if (action === 'disengage') {
       const state = securityGuard.disengageEmergencyStop(actor || 'Operator');
@@ -1197,7 +1400,7 @@ async function startServer() {
     res.json({ success: true, state });
   });
 
-  app.post('/api/security/emergency-stop/disengage', (req: Request, res: Response) => {
+  app.post('/api/security/emergency-stop/disengage', requireAdmin, (req: Request, res: Response) => {
     const { actor } = req.body;
     const state = securityGuard.disengageEmergencyStop(actor || 'Operator');
     fleetEngine.resumeAll();

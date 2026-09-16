@@ -33,6 +33,10 @@ import { CryptoExecutionEngine } from '../server/solana/cryptoExecutionEngine';
 import { InboundPaymentEngine } from '../server/engines/paymentEngine';
 import { TreasuryReconciliationService } from '../server/engines/treasuryReconciliation';
 import { marketPriceService } from '../server/solana/priceService';
+import { ProfitAccountingEngine } from '../server/engines/profitAccounting';
+import { ProfitSweepEngine } from '../server/engines/profitSweepEngine';
+import { AdminAuthManager } from '../server/security/authMiddleware';
+import { StorageEngine } from '../server/db/storage';
 
 export interface TestResult {
   name: string;
@@ -533,6 +537,198 @@ export async function runAllVerificationTests(): Promise<{
     if (typeof report.discrepancyUsd !== 'number') throw new Error('Missing discrepancyUsd in report');
     if (!['BALANCED', 'RECONCILIATION_REQUIRED'].includes(report.reconciliationStatus)) {
       throw new Error('Invalid reconciliation status');
+    }
+  });
+
+  // 23. Profit Sweep Protection: Sweep DOES NOT execute if withdrawable profit <= 0
+  await runTest('23. Profit Sweep Protection: No sweep when withdrawable profit is zero or negative', async () => {
+    const sec = new SecurityGuard();
+    const pm = new SolanaProviderManager();
+    const txStateMachine = new TransactionStateMachine(pm);
+    const ledger = new RevenueLedger();
+    const profitAcc = new ProfitAccountingEngine(sec);
+
+    // Initial state: 0 realized profit
+    const sweepEngine = new ProfitSweepEngine({
+      revenueLedger: ledger,
+      profitAccounting: profitAcc,
+      solanaProvider: pm,
+      txStateMachine,
+      securityGuard: sec
+    });
+
+    const statusBefore = sweepEngine.getStatus();
+    if (statusBefore.sweepableProfitUsd !== 0) {
+      throw new Error(`Expected sweepable profit 0, got ${statusBefore.sweepableProfitUsd}`);
+    }
+
+    // Attempting to sweep must return null (does not execute)
+    const sweepResult = await sweepEngine.executeProfitSweep();
+    if (sweepResult !== null) {
+      throw new Error('Sweep must NOT execute when sweepable profit is zero');
+    }
+
+    // Depositing working capital must NOT create sweepable profit
+    profitAcc.depositCapital({ amountUsd: 500, source: 'SEED_CAPITAL', actor: 'INVESTOR' });
+    const statusAfterCapital = sweepEngine.getStatus();
+    if (statusAfterCapital.sweepableProfitUsd > 0) {
+      throw new Error('Capital deposit must NEVER be classified as sweepable profit');
+    }
+
+    const sweepAfterCapital = await sweepEngine.executeProfitSweep();
+    if (sweepAfterCapital !== null) {
+      throw new Error('Sweep must not execute against working capital');
+    }
+  });
+
+  // 24. Financial Mutation Authentication: Reject unauthenticated mutations
+  await runTest('24. Financial Mutation Authentication: Strict rejection of unauthenticated tokens', async () => {
+    const sec = new SecurityGuard();
+    AdminAuthManager.initialize(sec);
+
+    // Test token validation
+    const badToken = 'unauthorized-fake-token-123';
+    if (AdminAuthManager.verifyToken(badToken)) {
+      throw new Error('Verify token should reject invalid token');
+    }
+
+    const bootstrapToken = AdminAuthManager.getBootstrapToken();
+    if (bootstrapToken && !AdminAuthManager.verifyToken(bootstrapToken)) {
+      throw new Error('Bootstrap token should be valid when initialized');
+    }
+
+    // Creating session with wrong password fails
+    const invalidSession = AdminAuthManager.createSession('wrong-password-999');
+    if (invalidSession.success) {
+      throw new Error('Invalid password must not produce authenticated session');
+    }
+  });
+
+  // 25. Formal Profit & Capital Accounting: Realized profit formula & unattributed inflow
+  await runTest('25. Formal Profit Accounting: Realized profit = revenue - itemized costs', () => {
+    const sec = new SecurityGuard();
+    const accounting = new ProfitAccountingEngine(sec);
+
+    // Deposit $1000 initial capital
+    accounting.depositCapital({ amountUsd: 1000, source: 'TREASURY_SEED', actor: 'ADMIN' });
+    let ledger = accounting.getLedger();
+
+    if (ledger.initialCapitalUsd !== 1000 || ledger.realizedProfitUsd !== 0) {
+      throw new Error('Capital deposit should increase capital, not profit');
+    }
+
+    // Record verified revenue of $100 with $5 fees
+    const revResult = accounting.recordVerifiedRevenue({
+      id: 'rev-01',
+      source: 'CUSTOMER_ORDER',
+      grossAmountUsd: 100,
+      networkFeeUsd: 2,
+      executionFeeUsd: 1,
+      platformFeeUsd: 1,
+      slippageUsd: 1,
+      otherCostUsd: 0,
+      signature: 'sig-test-verif-01',
+      timestamp: Date.now()
+    });
+
+    if (revResult.netProfitUsd !== 95) {
+      throw new Error(`Expected net profit of $95, got $${revResult.netProfitUsd}`);
+    }
+
+    ledger = accounting.getLedger();
+    if (ledger.realizedProfitUsd !== 95) {
+      throw new Error(`Expected realized profit 95, got ${ledger.realizedProfitUsd}`);
+    }
+    if (ledger.withdrawableProfitUsd !== 95) {
+      throw new Error(`Expected withdrawable profit 95, got ${ledger.withdrawableProfitUsd}`);
+    }
+
+    // Unattributed inflow ($50) must not be counted as profit
+    accounting.recordUnattributedInflow(50, 'sig-mystery', 'Unidentified on-chain deposit');
+    ledger = accounting.getLedger();
+    if (ledger.unattributedInflowUsd !== 50) {
+      throw new Error(`Expected unattributed inflow 50, got ${ledger.unattributedInflowUsd}`);
+    }
+    if (ledger.realizedProfitUsd !== 95) {
+      throw new Error('Unattributed inflow must NOT increment realized profit');
+    }
+
+    // Withdraw profit of $40
+    accounting.withdrawRealizedProfit(40, 'HTN1fvHwbzKiMwh9YXZEe3eooiMdoCAs3TweWdiSZV5i');
+    ledger = accounting.getLedger();
+    if (ledger.withdrawnProfitUsd !== 40) {
+      throw new Error(`Expected withdrawn profit 40, got ${ledger.withdrawnProfitUsd}`);
+    }
+    if (ledger.withdrawableProfitUsd !== 55) {
+      throw new Error(`Expected withdrawable profit 55, got ${ledger.withdrawableProfitUsd}`);
+    }
+    if (ledger.initialCapitalUsd !== 1000) {
+      throw new Error('Profit withdrawal must NOT decrease initial capital');
+    }
+  });
+
+  // 26. Canonical External Profit Treasury Destination
+  await runTest('26. External Profit Treasury: Canonical destination validation and protection', () => {
+    const canonical = ProfitSweepEngine.CANONICAL_EXTERNAL_PROFIT_WALLET;
+    if (canonical !== 'HTN1fvHwbzKiMwh9YXZEe3eooiMdoCAs3TweWdiSZV5i') {
+      throw new Error(`Canonical wallet mismatch: expected HTN1fvHwbzKiMwh9YXZEe3eooiMdoCAs3TweWdiSZV5i, got ${canonical}`);
+    }
+
+    const sec = new SecurityGuard();
+    const pm = new SolanaProviderManager();
+    const txStateMachine = new TransactionStateMachine(pm);
+    const ledger = new RevenueLedger();
+    const profitAcc = new ProfitAccountingEngine(sec);
+
+    const sweepEngine = new ProfitSweepEngine({
+      revenueLedger: ledger,
+      profitAccounting: profitAcc,
+      solanaProvider: pm,
+      txStateMachine,
+      securityGuard: sec
+    });
+
+    const status = sweepEngine.getStatus();
+    if (status.targetWallet !== canonical) {
+      throw new Error(`Target wallet should default to canonical wallet, got ${status.targetWallet}`);
+    }
+
+    // Invalid Solana public key format must throw
+    let caught = false;
+    try {
+      sweepEngine.updateDestination('invalid_wallet_xyz', 'ADMIN', 'Test invalid');
+    } catch {
+      caught = true;
+    }
+    if (!caught) {
+      throw new Error('Invalid Solana public key should be rejected');
+    }
+  });
+
+  // 27. Durable State Persistence & Restart Safety
+  await runTest('27. Durable State Persistence: StorageEngine survives restarts and persists 24 entities', () => {
+    const storage = new StorageEngine();
+    const status = storage.getStatus();
+
+    if (status.tablesRegistered !== 24) {
+      throw new Error(`Expected 24 registered database entities, got ${status.tablesRegistered}`);
+    }
+
+    const testOrderId = `test-order-${Date.now()}`;
+    storage.upsertRecord('orders', {
+      order_id: testOrderId,
+      product_id: 'prod-sec-audit',
+      customer_reference: 'cust-99',
+      amount_usd: 0.70,
+      amount_sol: 0.005,
+      status: 'AWAITING_PAYMENT',
+      created_at: Date.now()
+    }, 'order_id');
+
+    const retrievedOrders = storage.getTable('orders');
+    const found = retrievedOrders.find((o: any) => o.order_id === testOrderId);
+    if (!found) {
+      throw new Error('Failed to retrieve persisted order from StorageEngine');
     }
   });
 

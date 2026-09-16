@@ -43,6 +43,14 @@ export class YieldRanker {
 
     return Math.round(net * 100) / 100;
   }
+
+  public static rankByNetEv(opps: Opportunity[]): Opportunity[] {
+    return [...opps].sort((a, b) => {
+      const netA = a.netEvUsd !== undefined ? a.netEvUsd : YieldRanker.calculateNetEv(a);
+      const netB = b.netEvUsd !== undefined ? b.netEvUsd : YieldRanker.calculateNetEv(b);
+      return netB - netA;
+    });
+  }
 }
 
 export class OpportunityRegistry {
@@ -278,6 +286,10 @@ export class OpportunityRegistry {
 
   public getAll(): Opportunity[] {
     return Array.from(this.opportunities.values());
+  }
+
+  public getActiveOpportunities(): Opportunity[] {
+    return Array.from(this.opportunities.values()).filter(o => o.status === 'ACTIVE' || !o.status);
   }
 
   public getRanked(availableCapitalUsd: number, availableGasSol: number): Opportunity[] {

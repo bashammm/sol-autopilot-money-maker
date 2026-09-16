@@ -25,6 +25,8 @@ import {
 import { SolanaProviderManager } from '../solana/provider';
 import { CentralizedTreasuryManager } from '../solana/treasuryConfig';
 import { RevenueLedger } from './revenueLedger';
+import { ProfitAccountingEngine } from './profitAccounting';
+import { StorageEngine } from '../db/storage';
 import { MarketPriceService } from '../solana/priceService';
 import { SecurityGuard } from '../security/guard';
 
@@ -37,21 +39,51 @@ export class InboundPaymentEngine {
   private revenueLedger: RevenueLedger;
   private priceService: MarketPriceService;
   private securityGuard: SecurityGuard;
+  private profitAccounting?: ProfitAccountingEngine;
+  private storageEngine?: StorageEngine;
 
   constructor(
     providerManager: SolanaProviderManager,
     treasuryManager: CentralizedTreasuryManager,
     revenueLedger: RevenueLedger,
     priceService: MarketPriceService,
-    securityGuard: SecurityGuard
+    securityGuard: SecurityGuard,
+    profitAccounting?: ProfitAccountingEngine,
+    storageEngine?: StorageEngine
   ) {
     this.providerManager = providerManager;
     this.treasuryManager = treasuryManager;
     this.revenueLedger = revenueLedger;
     this.priceService = priceService;
     this.securityGuard = securityGuard;
+    this.profitAccounting = profitAccounting;
+    this.storageEngine = storageEngine;
 
     this.initializeProducts();
+    this.restoreFromStorage();
+  }
+
+  private restoreFromStorage() {
+    if (!this.storageEngine) return;
+    try {
+      const storedOrders = this.storageEngine.getTable<CustomerOrder>('orders');
+      for (const ord of storedOrders) {
+        if (ord && ord.order_id) {
+          this.orders.set(ord.order_id, ord);
+        }
+      }
+      const storedEv = this.storageEngine.getTable<PaymentEvidence>('payment_evidence');
+      for (const ev of storedEv) {
+        if (ev && ev.transaction_signature) {
+          this.paymentEvidenceMap.set(ev.transaction_signature, ev);
+        }
+      }
+      if (storedOrders.length > 0) {
+        console.log(`[InboundPaymentEngine] Restored ${storedOrders.length} orders from persistent ledger.`);
+      }
+    } catch (err: any) {
+      console.warn('[InboundPaymentEngine] Storage restoration warning:', err.message);
+    }
   }
 
   private initializeProducts() {
@@ -192,6 +224,9 @@ export class InboundPaymentEngine {
     };
 
     this.orders.set(orderId, order);
+    if (this.storageEngine) {
+      this.storageEngine.upsertRecord('orders', order, 'order_id');
+    }
 
     const memo = `YABBAI:${orderId}:${product.sku}`;
     const solanaPayUrl = `solana:${recipient}?amount=${amountDue}&reference=${referenceKey}&label=${encodeURIComponent(product.name)}&message=${encodeURIComponent(memo)}`;
@@ -403,6 +438,45 @@ export class InboundPaymentEngine {
         amountUsd: verifiedAmountUsd,
         network: cluster === 'devnet' ? 'solana-devnet' : 'solana-mainnet'
       });
+
+      if (this.profitAccounting) {
+        try {
+          this.profitAccounting.recordVerifiedRevenue({
+            id: `rev-${orderId}`,
+            source: 'CUSTOMER_ORDER',
+            grossAmountUsd: verifiedAmountUsd,
+            networkFeeUsd: 0.0005,
+            executionFeeUsd: 0.0,
+            platformFeeUsd: 0.0,
+            slippageUsd: 0.0,
+            otherCostUsd: 0.0,
+            signature: transactionSignature,
+            timestamp: Date.now(),
+            metadata: {
+              orderId,
+              productSku: order.product_sku,
+              sender: verifiedSender
+            }
+          });
+        } catch (accErr: any) {
+          console.warn('[InboundPaymentEngine] Accounting record warning:', accErr.message);
+        }
+      }
+
+      if (this.storageEngine) {
+        this.storageEngine.upsertRecord('orders', order, 'order_id');
+        this.storageEngine.upsertRecord('payment_evidence', evidence, 'id');
+        this.storageEngine.upsertRecord('payments', {
+          payment_id: `pay-${orderId}`,
+          order_id: orderId,
+          amount_lamports: Math.round(verifiedAmountSol * LAMPORTS_PER_SOL),
+          amount_usd: verifiedAmountUsd,
+          sender_address: verifiedSender,
+          recipient_address: verifiedRecipient,
+          status: 'SETTLED',
+          confirmed_at: Date.now()
+        }, 'payment_id');
+      }
 
       this.securityGuard.recordAudit({
         actor: verifiedSender,
